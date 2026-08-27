@@ -101,6 +101,7 @@ class ProtocolResolution:
     codec: str
     confidence: float
     repeatable: bool = False
+    transport: str | None = None
     model_num: int | None = None
     firmware_version: int | None = None
     capabilities: set[str] = field(default_factory=set)
@@ -129,6 +130,40 @@ class LightState:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def rgb_chromaticity_matches(
+    expected: tuple[int, int, int],
+    actual: tuple[int, int, int],
+    tolerance: int = 12,
+) -> bool:
+    """Compare RGB chromaticity without comparing brightness twice."""
+    expected_max = max(expected)
+    actual_max = max(actual)
+    if expected_max == 0 or actual_max == 0:
+        return expected_max == actual_max
+    expected_normalized = tuple(round(channel * 255 / expected_max) for channel in expected)
+    actual_normalized = tuple(round(channel * 255 / actual_max) for channel in actual)
+    return all(
+        abs(left - right) <= tolerance
+        for left, right in zip(expected_normalized, actual_normalized, strict=True)
+    )
+
+
+def rgb_state_matches(
+    state: LightState,
+    rgb: tuple[int, int, int],
+    brightness: int,
+    brightness_tolerance: int = 16,
+) -> bool:
+    """Return true when a reported RGB state matches a command."""
+    return bool(
+        state.rgb is not None
+        and state.brightness is not None
+        and state.white == 0
+        and rgb_chromaticity_matches(rgb, state.rgb)
+        and abs(brightness - state.brightness) <= brightness_tolerance
+    )
 
 
 def apply_assumed_rgb(

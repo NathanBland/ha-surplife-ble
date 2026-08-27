@@ -108,20 +108,28 @@ def classify_packet(packet: bytes) -> tuple[ProtocolResolution, bytes, str] | No
                 codec = "extended-custom"
                 confidence = 0.95
                 capabilities.update({"rgb", "brightness", "candidate-white"})
+            elif (
+                len(candidate) >= 27
+                and candidate[4:6] == b"\xaa\x09"
+                and candidate[IOTBT_POS_COLOR_WHITE_MODE]
+                in (IOTBT_COLOR_MODE, IOTBT_WHITE_MODE)
+                and candidate[IOTBT_POS_SATURATION] <= 100
+                and candidate[IOTBT_POS_BRIGHTNESS] <= 100
+            ):
+                model_num = None
+                firmware = None
+                codec = "iotbt-ea81"
+                confidence = 0.95
+                capabilities.update({"rgb", "brightness", "candidate-white", "power"})
+                notes.append(
+                    "IOTBT EA 81 layout matches the verified DX23012 state signature."
+                )
             else:
                 model_num = None
                 firmware = None
-                # The IOTBT DX23012 uses the same HSV byte positions (11/12/13)
-                # as the extended-custom codec, but with a different model byte
-                # and extra mode bytes at positions 7-8. Confirmed by state-diff
-                # captures on 2026-08-26/27.
-                codec = "iotbt-ea81"
-                confidence = 0.90
-                capabilities.update({"rgb", "brightness", "candidate-white", "power"})
-                notes.append(
-                    "IOTBT EA 81 layout: HSV at pos 11/12/13 confirmed by state-diff. "
-                    "Pos 7-8 encode color/white mode. Model and firmware not inferred."
-                )
+                codec = "unresolved-ea81"
+                confidence = 0.50
+                notes.append("Unknown EA 81 layout. Control remains locked.")
             if model_num == 0xB6:
                 capabilities.add("candidate-e122")
                 notes.append("E1 22 remains experimental for this physical lamp.")
@@ -194,6 +202,11 @@ def parse_state(packet: bytes) -> LightState | None:
             raw_hex=state.hex(),
         )
     if resolution.frame_family == "extended-ea81":
+        if resolution.codec == "unresolved-ea81":
+            return LightState(
+                power=state[IOTBT_POS_POWER] == POWER_ON,
+                raw_hex=state.hex(),
+            )
         if resolution.codec == "iotbt-ea81":
             # IOTBT DX23012: HSV at pos 11/12/13, color/white mode at pos 7-8.
             # Hue is 0-180 (half degrees), saturation and brightness are 0-100.

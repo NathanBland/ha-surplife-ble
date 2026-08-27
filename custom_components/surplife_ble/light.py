@@ -78,11 +78,19 @@ class SurplifeLight(CoordinatorEntity[SurplifeCoordinator], LightEntity):
         )
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        brightness = cast(int, kwargs.get(ATTR_BRIGHTNESS) or self.brightness or 255)
+        requested_brightness = cast(int | None, kwargs.get(ATTR_BRIGHTNESS))
+        brightness = (
+            requested_brightness
+            if requested_brightness is not None
+            else self.brightness if self.brightness is not None else 255
+        )
         if ATTR_RGB_COLOR in kwargs:
             await self.coordinator.async_set_rgb(kwargs[ATTR_RGB_COLOR], brightness)
         elif ATTR_WHITE in kwargs:
-            await self.coordinator.async_set_white(cast(int, kwargs[ATTR_WHITE] or 255))
+            requested_white = cast(int | None, kwargs[ATTR_WHITE])
+            await self.coordinator.async_set_white(
+                requested_white if requested_white is not None else 255
+            )
         elif ATTR_BRIGHTNESS in kwargs:
             await self.coordinator.async_set_brightness(brightness)
         else:

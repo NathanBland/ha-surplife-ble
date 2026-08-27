@@ -21,6 +21,7 @@ from .models import (
     LightState,
     ProtocolResolution,
     TrafficRecord,
+    rgb_state_matches,
 )
 from .protocol import (
     ProbeFrame,
@@ -34,6 +35,7 @@ from .protocol import (
     extended_e0_white,
     extended_zone_power_off,
     frame_for_transport,
+    iotbt_3b_white,
     iotbt_e1_segment_rgb,
     iotbt_power,
     original_power,
@@ -105,6 +107,7 @@ class LightClient:
     async def connect(self) -> None:
         if self.connected:
             return
+        self.mark_disconnected()
         created = self._client_factory(self.device)
         self._client = await created if inspect.isawaitable(created) else created
         if not self._client.is_connected:
@@ -112,13 +115,20 @@ class LightClient:
         self._profile = self._build_profile()
         self._write_characteristic = self._choose_write_characteristic(self._profile)
 
+    def mark_disconnected(self, client: Any | None = None) -> None:
+        """Clear state that belongs to the previous BLE connection."""
+        if client is not None and client is not self._client:
+            return
+        self._notifying.clear()
+        self._flush_notifications()
+
     async def disconnect(self) -> None:
         if self._client is None:
             return
         for uuid in tuple(self._notifying):
             with suppress(Exception):
                 await self._client.stop_notify(uuid)
-        self._notifying.clear()
+        self.mark_disconnected()
         if self._client.is_connected:
             await self._client.disconnect()
 
@@ -131,7 +141,7 @@ class LightClient:
 
     def _require_client(self) -> BleakClientLike:
         if self._client is None or not self._client.is_connected:
-            raise RuntimeError("BLE client is not connected")
+            raise ConnectionError("BLE client is not connected")
         return self._client
 
     def _build_profile(self) -> GattProfile:
@@ -259,6 +269,7 @@ class LightClient:
         note: str,
         characteristic: GattCharacteristic | None = None,
     ) -> None:
+        await self._start_notifications()
         framed = frame_for_transport(payload, transport, self._sequence.next())
         await self._write(
             framed,
@@ -291,7 +302,10 @@ class LightClient:
         return packets
 
     async def _await_classification(
-        self, wait_seconds: float
+        self,
+        wait_seconds: float,
+        *,
+        allow_reads: bool = True,
     ) -> tuple[ProtocolResolution, LightState | None] | None:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + wait_seconds
@@ -307,12 +321,13 @@ class LightClient:
                 resolution, _inner, framing = classified
                 resolution.notes.append(f"Response interpretation: {framing}")
                 return resolution, parse_state(packet)
-        for _characteristic, packet in await self._read_candidates():
-            classified = classify_packet(packet)
-            if classified:
-                resolution, _inner, framing = classified
-                resolution.notes.append(f"Read interpretation: {framing}")
-                return resolution, parse_state(packet)
+        if allow_reads:
+            for _characteristic, packet in await self._read_candidates():
+                classified = classify_packet(packet)
+                if classified:
+                    resolution, _inner, framing = classified
+                    resolution.notes.append(f"Read interpretation: {framing}")
+                    return resolution, parse_state(packet)
         return None
 
     async def probe(
@@ -379,6 +394,7 @@ class LightClient:
                     )
                     if same_identity:
                         resolution.repeatable = True
+                        resolution.transport = candidate.transport
                         resolution.confidence = 1.0
                         resolution.notes.append(
                             "State response repeated with the same frame family/model."
@@ -400,6 +416,7 @@ class LightClient:
                         return resolution
         if best:
             self.resolution, self.state, self._probe_frame = best
+            self.resolution.transport = self._probe_frame.transport
             self.resolution.notes.append("A matching response was seen once but not confirmed.")
             return self.resolution
         return None
@@ -419,12 +436,14 @@ class LightClient:
             note="state refresh",
         )
         result = await self._await_classification(1.5)
-        if result:
-            resolution, state = result
-            resolution.repeatable = bool(self.resolution and self.resolution.repeatable)
-            self.resolution = resolution
-            self.state = state
-        return self.state
+        if result is None:
+            return None
+        resolution, state = result
+        resolution.repeatable = bool(self.resolution and self.resolution.repeatable)
+        resolution.transport = self.resolution.transport if self.resolution else None
+        self.resolution = resolution
+        self.state = state
+        return state
 
     async def query_raw_state(self) -> bytes | None:
         """Query and return the raw state packet bytes, or None if no response."""
@@ -490,15 +509,20 @@ class LightClient:
             )
             await self._send_inner(payload, probe.transport, note="set rgb")
         elif resolution.codec == "iotbt-ea81":
-            # Use the verified E1 03 segment command, which updates the
-            # lamp's persisted EA 81 state. The older 3B A1 command only
-            # changes the physical output and leaves stale state.
             payload = iotbt_e1_segment_rgb(red, green, blue, brightness)
+            expected_brightness = round(brightness * 255 / 100)
+            self._flush_notifications()
             await self._send_inner(payload, probe.transport, note="set rgb e1 03")
-            await self._confirm_command_state(
-                expected_rgb=(red, green, blue),
-                expected_brightness=round(brightness * 255 / 100),
+            self.state = LightState(
+                power=True,
+                rgb=(red, green, blue),
+                brightness=expected_brightness,
+                white=0,
+                model_num=resolution.model_num,
+                firmware_version=resolution.firmware_version,
+                assumed=True,
             )
+            await self._confirm_rgb_notification((red, green, blue), expected_brightness)
             return
         elif experimental_e122:
             if "candidate-e122" not in resolution.capabilities:
@@ -521,53 +545,24 @@ class LightClient:
             assumed=True,
         )
 
-    async def _confirm_command_state(
+    async def _confirm_rgb_notification(
         self,
-        *,
-        expected_rgb: tuple[int, int, int] | None = None,
-        expected_brightness: int | None = None,
-        expected_white: int | None = None,
+        expected_rgb: tuple[int, int, int],
+        expected_brightness: int,
     ) -> None:
-        """Query EA 81 state after a command and reconcile assumed state.
-
-        If the device reports a state that matches the command, mark the
-        state as confirmed (assumed=False). Otherwise keep the commanded
-        values as assumed so the UI does not flicker to a stale reading.
-        """
-        resolution = self.resolution
-        if resolution is None:
+        """Accept a fresh state notification without delaying the command."""
+        result = await self._await_classification(0.2, allow_reads=False)
+        if result is None:
             return
-        confirmed = await self.query_state()
-        if confirmed is None:
-            self.state = self.state or LightState()
-            self.state.assumed = True
-            return
-        if resolution.codec == "iotbt-ea81":
-            matched = True
-            if expected_rgb is not None and confirmed.rgb is not None:
-                # The EA 81 HSV round-trip is lossy. Accept a close match.
-                matched = all(
-                    abs(a - b) <= 12
-                    for a, b in zip(expected_rgb, confirmed.rgb, strict=False)
-                )
-            if expected_brightness is not None and confirmed.brightness is not None:
-                matched = matched and abs(expected_brightness - confirmed.brightness) <= 16
-            if expected_white is not None:
-                matched = matched and abs(expected_white - (confirmed.white or 0)) <= 16
-            if matched:
-                confirmed.assumed = False
-            else:
-                # Keep the commanded values as assumed state.
-                if expected_rgb is not None:
-                    confirmed.rgb = expected_rgb
-                if expected_brightness is not None:
-                    confirmed.brightness = expected_brightness
-                if expected_white is not None:
-                    confirmed.white = expected_white
-                confirmed.assumed = True
-        else:
-            confirmed.assumed = True
-        self.state = confirmed
+        resolution, confirmed = result
+        resolution.repeatable = bool(self.resolution and self.resolution.repeatable)
+        resolution.transport = self.resolution.transport if self.resolution else None
+        self.resolution = resolution
+        if confirmed is not None and rgb_state_matches(
+            confirmed, expected_rgb, expected_brightness
+        ):
+            confirmed.assumed = False
+            self.state = confirmed
 
     async def set_white(
         self,
@@ -585,15 +580,8 @@ class LightClient:
             )
             await self._send_inner(payload, probe.transport, note="set white")
         elif resolution.codec == "iotbt-ea81":
-            # White is HSV with saturation 0. The E1 03 segment command
-            # persists this in the EA 81 state.
-            payload = iotbt_e1_segment_rgb(255, 255, 255, brightness)
-            await self._send_inner(payload, probe.transport, note="set white e1 03")
-            await self._confirm_command_state(
-                expected_white=white_byte,
-                expected_brightness=white_byte,
-            )
-            return
+            payload = iotbt_3b_white(brightness)
+            await self._send_inner(payload, probe.transport, note="set white")
         elif experimental_e122:
             if "candidate-e122" not in resolution.capabilities:
                 raise RuntimeError("E1 22 is only enabled for a matching extended candidate")
@@ -618,15 +606,13 @@ class LightClient:
             # The 3B 01 standalone brightness command is not accepted by this
             # device. Re-send the current color or white command with the new
             # brightness, which is what the official app does.
-            if self.state and self.state.white and not any(
-                self.state.rgb or (0, 0, 0)
-            ):
+            if self.state and self.state.white:
                 await self.set_white(brightness)
             else:
                 rgb = self.state.rgb if self.state and self.state.rgb else (255, 255, 255)
                 await self.set_rgb(*rgb, brightness=brightness)
             return
-        if self.state and self.state.white and not any(self.state.rgb or (0, 0, 0)):
+        if self.state and self.state.white:
             await self.set_white(brightness)
             return
         rgb = self.state.rgb if self.state and self.state.rgb else (255, 255, 255)

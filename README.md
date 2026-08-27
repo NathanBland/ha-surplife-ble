@@ -10,19 +10,20 @@ It supports the MIHEAL DX23012 floor lamp and similar devices that use the IOTBT
 
 | Capability | Status |
 | --- | --- |
-| Power on and off | Verified |
-| RGB color | Verified |
-| White brightness | Verified |
-| Overall brightness | Verified |
-| State confirmation | Verified |
+| Power on and off | Verified on DX23012 |
+| RGB color | Verified on one DX23012 |
+| White brightness | Needs hardware retest |
+| Overall brightness | Verified on one DX23012 |
+| State confirmation | Verified on one DX23012 |
 | Multiple devices | Supported |
 | Automatic discovery | Supported |
 | Manual setup | Supported |
 
 ## Supported devices
 
-- MIHEAL DX23012 floor lamp
-- Other BLE lights that advertise with the `IOTBT` name prefix
+- MIHEAL DX23012 floor lamp with the verified IOTBT state signature
+
+Other `IOTBT` devices can use different commands. An `IOTBT` name alone does not prove compatibility.
 
 ## Requirements
 
@@ -61,15 +62,18 @@ Configure the integration through the UI:
 
 **Color state may show as "assumed" on the first command.**
 
-The integration sends a color command and then queries the device state.
-If the device confirms the new color, the state shows as confirmed.
-If the device does not respond in time, the state shows as "assumed".
-The next successful poll replaces the assumed state with the real device state.
+The integration sends a color command immediately.
+It accepts a matching notification when the lamp sends one.
+Otherwise, it shows an assumed state and requests a background refresh.
+A matching poll confirms the state. The assumed state expires after five seconds.
 
 **Use one controller at a time.**
 
 The lamp accepts one active BLE controller at a time.
-If you change the lamp with the physical button or the vendor app, Home Assistant will detect the change on the next poll.
+The integration keeps its connection open for faster commands.
+Each connected lamp uses one Bluetooth adapter or proxy connection slot.
+Close the vendor app before you control the lamp from Home Assistant.
+External changes appear after the assumed state expires and a poll succeeds.
 
 **Brightness in color mode sends the full color command again.**
 
@@ -88,8 +92,9 @@ The integration resends the current color with the new brightness value.
 ### Commands do not work
 
 - Power on and power off should always work. If they do not, make sure the device is connected.
-- Color changes work. The integration confirms the new color with the device after each command.
-- If the state shows as "assumed", the device did not confirm the change in time. The next poll will correct it.
+- Color changes work on a verified DX23012 state signature.
+- An assumed state means that the lamp did not send a matching notification.
+- A background refresh confirms or corrects the state.
 - If the light does not respond, power cycle it. Then reload the integration.
 
 ### State shows the wrong color after a restart

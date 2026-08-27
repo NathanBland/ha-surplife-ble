@@ -75,6 +75,16 @@ def test_extended_state_uses_frame_shape_not_registration(fixture_name: str, mod
     assert state.led_count == 100
 
 
+def test_unknown_ea81_layout_remains_control_locked() -> None:
+    packet = bytearray(bytes.fromhex(FIXTURES["dx23012_iotbt144"]["state_hex"]))
+    packet[4:6] = bytes.fromhex("1234")
+    classified = classify_packet(bytes(packet))
+    assert classified is not None
+    resolution, _inner, _framing = classified
+    assert resolution.codec == "unresolved-ea81"
+    assert "rgb" not in resolution.capabilities
+
+
 def test_physical_dx23012_json_response_is_authoritative() -> None:
     fixture = FIXTURES["dx23012_iotbt144"]
     packet = bytes.fromhex(fixture["wrapped_response_hex"])

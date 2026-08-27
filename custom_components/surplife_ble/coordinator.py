@@ -10,6 +10,7 @@ from typing import Any
 
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
+from bleak.exc import BleakError
 from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
@@ -19,9 +20,11 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .const import UPDATE_INTERVAL
 from .core.client import LightClient
-from .core.models import LightState, apply_assumed_rgb
+from .core.models import LightState, apply_assumed_rgb, rgb_state_matches
 
 _LOGGER = logging.getLogger(__name__)
+_ASSUMED_RGB_SECONDS = 5.0
+_CONFIRMATION_DELAY_SECONDS = 0.3
 
 
 @dataclass(slots=True)
@@ -52,6 +55,8 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
         self._operation_lock = asyncio.Lock()
         self._assumed_rgb: tuple[int, int, int] | None = None
         self._assumed_rgb_brightness: int | None = None
+        self._assumed_rgb_deadline: float | None = None
+        self._confirmation_generation = 0
 
     def async_set_ble_device(
         self, device: BLEDevice, advertisement: AdvertisementData | None
@@ -68,7 +73,9 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
             BleakClientWithServiceCache,
             device,
             self.config_entry.title,
-            lambda _client: None,
+            lambda disconnected: (
+                self.client.mark_disconnected(disconnected) if self.client else None
+            ),
             use_services_cache=True,
             ble_device_callback=lambda: self._ble_device or device,
         )
@@ -91,6 +98,50 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
         await self.client.connect()
         return self.client
 
+    def _clear_assumed_rgb(self) -> None:
+        self._assumed_rgb = None
+        self._assumed_rgb_brightness = None
+        self._assumed_rgb_deadline = None
+
+    def _reconcile_assumed_rgb(self, state: LightState) -> LightState:
+        if self._assumed_rgb is None or self._assumed_rgb_brightness is None:
+            state.assumed = False
+            return state
+        if rgb_state_matches(state, self._assumed_rgb, self._assumed_rgb_brightness):
+            self._clear_assumed_rgb()
+            state.assumed = False
+            return state
+        deadline = self._assumed_rgb_deadline
+        if deadline is None or asyncio.get_running_loop().time() >= deadline:
+            self._clear_assumed_rgb()
+            state.assumed = False
+            return state
+        return apply_assumed_rgb(
+            state,
+            self._assumed_rgb,
+            self._assumed_rgb_brightness,
+        )
+
+    async def _refresh_after_assumed_deadline(self, deadline: float) -> None:
+        await asyncio.sleep(max(0, deadline - asyncio.get_running_loop().time()))
+        if self._assumed_rgb_deadline == deadline:
+            await self.async_request_refresh()
+
+    async def _refresh_after_command(self, generation: int) -> None:
+        await asyncio.sleep(_CONFIRMATION_DELAY_SECONDS)
+        if self._confirmation_generation == generation:
+            await self.async_request_refresh()
+
+    def _request_confirmation(self) -> None:
+        self._confirmation_generation += 1
+        self.hass.async_create_task(
+            self._refresh_after_command(self._confirmation_generation)
+        )
+        if self._assumed_rgb_deadline is not None:
+            self.hass.async_create_task(
+                self._refresh_after_assumed_deadline(self._assumed_rgb_deadline)
+            )
+
     async def _async_update_data(self) -> LightState:
         try:
             async with self._operation_lock:
@@ -100,11 +151,7 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
                     raise UpdateFailed("device did not return a supported state frame")
                 if not client.resolution or not client.resolution.repeatable:
                     raise UpdateFailed("device state response could not be repeated")
-                state = apply_assumed_rgb(
-                    state,
-                    self._assumed_rgb,
-                    self._assumed_rgb_brightness,
-                )
+                state = self._reconcile_assumed_rgb(state)
                 if not self._was_available:
                     _LOGGER.info("Surplife BLE device %s is now available", self.address)
                     self._was_available = True
@@ -134,9 +181,7 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
                     await client.query_state()
                 command = getattr(client, method)
                 await command(*args, **kwargs)
-            except Exception as err:
-                # The connection may have dropped silently. Disconnect,
-                # reconnect, and retry the command once.
+            except (BleakError, TimeoutError, OSError) as err:
                 _LOGGER.debug("Command %s failed, retrying: %s", method, err)
                 if self.client:
                     with suppress(Exception):
@@ -153,39 +198,49 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
     async def async_set_power(self, turn_on: bool) -> None:
         await self._async_command("set_power", turn_on)
 
-    async def async_set_rgb(self, rgb: tuple[int, int, int], brightness: int) -> None:
-        brightness = brightness or 255
+    async def async_set_rgb(
+        self, rgb: tuple[int, int, int], brightness: int | None
+    ) -> None:
+        if brightness is None:
+            brightness = 255
         state = await self._async_command(
             "set_rgb", *rgb, brightness=max(1, round(brightness / 255 * 100))
         )
-        if state.assumed:
+        if state.assumed and state.rgb is not None and state.brightness is not None:
             self._assumed_rgb = state.rgb
             self._assumed_rgb_brightness = state.brightness
+            self._assumed_rgb_deadline = (
+                asyncio.get_running_loop().time() + _ASSUMED_RGB_SECONDS
+            )
+            self._request_confirmation()
         else:
-            self._assumed_rgb = None
-            self._assumed_rgb_brightness = None
+            self._clear_assumed_rgb()
 
-    async def async_set_white(self, brightness: int) -> None:
-        brightness = brightness or 255
+    async def async_set_white(self, brightness: int | None) -> None:
+        if brightness is None:
+            brightness = 255
         await self._async_command("set_white", max(1, round(brightness / 255 * 100)))
-        self._assumed_rgb = None
-        self._assumed_rgb_brightness = None
+        self._clear_assumed_rgb()
+        self._request_confirmation()
 
-    async def async_set_brightness(self, brightness: int) -> None:
-        brightness = brightness or 255
+    async def async_set_brightness(self, brightness: int | None) -> None:
+        if brightness is None:
+            brightness = 255
         state = await self._async_command(
             "set_brightness", max(1, round(brightness / 255 * 100))
         )
         if state.assumed:
-            if state.white:
-                self._assumed_rgb = None
-                self._assumed_rgb_brightness = None
-            else:
+            if not state.white and state.rgb is not None and state.brightness is not None:
                 self._assumed_rgb = state.rgb
                 self._assumed_rgb_brightness = state.brightness
+                self._assumed_rgb_deadline = (
+                    asyncio.get_running_loop().time() + _ASSUMED_RGB_SECONDS
+                )
+            else:
+                self._clear_assumed_rgb()
+            self._request_confirmation()
         else:
-            self._assumed_rgb = None
-            self._assumed_rgb_brightness = None
+            self._clear_assumed_rgb()
 
     async def async_disconnect(self) -> None:
         if self.client:

@@ -90,21 +90,33 @@ The persistent shell succeeded because it completes the full session: connect, d
 The one-shot path likely skipped the notification subscription or codec exchange.
 Each step was not tested in isolation, so this is the current hypothesis.
 
-## 7. Next steps
+## 7. Implementation status
 
-1. Add an `E1 03` encoder to `custom_components/surplife_ble/core/protocol.py`.
-2. Add a client method that builds and sends the segment command.
-3. Use the `0x0A` transport family and 20 segments for the DX23012 codec.
-4. Route RGB color and RGB brightness commands through `E1 03`.
-5. Query the `EA 81` state after each command.
-6. Mark the state as confirmed when the response matches the command.
-7. Keep the assumed-state overlay only when confirmation fails.
-8. Test the same command on the second lamp.
-9. Test through the ESPHome Bluetooth proxy and a direct USB adapter.
-10. Add unit tests for the encoder, frame length, and segment records.
-11. Keep the `3B A1` command as an experimental fallback until the second lamp passes the same tests.
+The integration now uses `E1 03` for RGB color and RGB brightness on the verified DX23012 state signature.
+It uses the captured `0x0A` transport family and 20 segment records.
+It subscribes to notifications before each command session.
+It accepts a matching notification for 0.2 seconds after an RGB command.
+It then returns control to Home Assistant.
+It delays the background refresh for 0.3 seconds and combines rapid command updates.
+The assumed RGB state expires after five seconds.
+The next matching poll confirms the state before expiration.
 
-## 8. Safety
+The integration continues to use the legacy `3B B1` candidate for dedicated white mode.
+The dedicated white command still requires a hardware retest.
+An `E1 03` command with zero saturation is not verified as a dedicated white command.
+
+## 8. Remaining validation
+
+1. Test RGB commands on the second lamp.
+2. Test dedicated white mode after an RGB command.
+3. Test RGB mode after a white command.
+4. Test through an ESPHome Bluetooth proxy.
+5. Test through a direct USB Bluetooth adapter.
+6. Confirm notification registration after an unexpected disconnect.
+7. Measure rapid slider updates with the Home Assistant interface.
+8. Keep `3B A1` as an experimental fallback until both lamps pass the tests.
+
+## 9. Safety
 
 - Use only the verified device for new tests.
 - Send reviewed application-level ATT writes one at a time.
