@@ -32,7 +32,7 @@ These corrections showed the captured traffic from the Android app was a sequenc
 
 - State frames use the `EA 81` prefix.
 - The full state frame is 27 bytes.
-- Byte 6 is power: `0x23` means off, `0x24` means on.
+- Byte 6 is power: `0x23` means on, `0x24` means off.
 - Byte 11 is hue on a `0` to `180` scale.
 - Byte 12 is saturation.
 - Byte 13 is brightness.

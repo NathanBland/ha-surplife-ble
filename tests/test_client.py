@@ -7,7 +7,11 @@ import pytest
 
 from custom_components.surplife_ble.core.client import LightClient
 from custom_components.surplife_ble.core.framing import with_checksum
-from custom_components.surplife_ble.core.models import TrafficRecord
+from custom_components.surplife_ble.core.models import (
+    LightState,
+    TrafficRecord,
+    apply_assumed_rgb,
+)
 
 
 @dataclass
@@ -130,7 +134,7 @@ class FakeIotbtBleakClient(FakeBleakClient):
 
 
 @pytest.mark.asyncio
-async def test_iotbt_set_rgb_uses_3b_a1_format() -> None:
+async def test_iotbt_set_rgb_uses_e1_03_segment_format() -> None:
     fake = FakeIotbtBleakClient()
     client = LightClient(FakeDevice(), client_factory=lambda _device: fake)  # type: ignore[arg-type]
     async with client:
@@ -139,38 +143,85 @@ async def test_iotbt_set_rgb_uses_3b_a1_format() -> None:
         assert resolution.codec == "iotbt-ea81"
 
         await client.set_rgb(255, 0, 0, brightness=50)
-        sent = fake.writes[-1][1]
-        assert sent[8] == 0x3B
-        assert sent[9] == 0xA1
+        # The E1 03 command is the second-to-last write; the last write is
+        # the confirmation state query. The command is wrapped in magichome2
+        # framing, so after the 8-byte header the inner payload starts with
+        # E1 03.
+        sent = fake.writes[-2][1]
+        assert sent[8] == 0xE1
+        assert sent[9] == 0x03
         assert client.state is not None
+        # The fake's static state does not match the commanded color, so
+        # the client keeps the commanded values as assumed state.
         assert client.state.assumed
+        assert client.state.rgb == (255, 0, 0)
 
 
 @pytest.mark.asyncio
-async def test_iotbt_set_white_uses_3b_b1_format() -> None:
+async def test_iotbt_set_white_uses_e1_03_segment_format() -> None:
     fake = FakeIotbtBleakClient()
     client = LightClient(FakeDevice(), client_factory=lambda _device: fake)  # type: ignore[arg-type]
     async with client:
         await client.probe(allow_writes=True, response_timeout=0.5)
         await client.set_white(50)
-        sent = fake.writes[-1][1]
-        assert sent[8] == 0x3B
-        assert sent[9] == 0xB1
+        sent = fake.writes[-2][1]
+        assert sent[8] == 0xE1
+        assert sent[9] == 0x03
 
 
 @pytest.mark.asyncio
-async def test_iotbt_set_brightness_resends_color() -> None:
-    """Brightness resends the current color with new brightness,
-    not the standalone 3B 01 command (which this device ignores)."""
+async def test_iotbt_set_brightness_resends_color_via_e1_03() -> None:
+    """Brightness resends the current color with new brightness via E1 03."""
     fake = FakeIotbtBleakClient()
     client = LightClient(FakeDevice(), client_factory=lambda _device: fake)  # type: ignore[arg-type]
     async with client:
         await client.probe(allow_writes=True, response_timeout=0.5)
         await client.set_rgb(255, 0, 0, brightness=50)
+        first_count = len(fake.writes)
         await client.set_brightness(75)
-        sent = fake.writes[-1][1]
-        assert sent[8] == 0x3B
-        assert sent[9] == 0xA1
+        # set_brightness re-sends the color command via set_rgb, which
+        # uses the E1 03 encoder. The E1 03 command is the first write of
+        # this batch; the second is the confirmation query.
+        sent = fake.writes[first_count][1]
+        assert sent[8] == 0xE1
+        assert sent[9] == 0x03
+
+
+class FakeIotbtConfirmingBleakClient(FakeIotbtBleakClient):
+    """Fake device that updates its state to match the commanded color.
+
+    This simulates a real DX23012 that persists the E1 03 segment command
+    in its EA 81 state response.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._commanded_state: bytes | None = None
+
+    async def write_gatt_char(self, uuid: str, data: bytes, response: bool | None = None) -> None:
+        self.writes.append((uuid, bytes(data), response))
+        # Respond to magichome2-framed probes with the current state.
+        if data[2:4] == bytes.fromhex("8000") and data.endswith(bytes.fromhex("ea818a8b")):
+            callback = self.callbacks[self.notify.uuid]
+            state = self._commanded_state or self.state
+            callback(self.notify, bytearray(state))
+
+
+@pytest.mark.asyncio
+async def test_iotbt_set_rgb_confirmed_state_is_not_assumed() -> None:
+    """When the device reports a matching state, assumed is False."""
+    fake = FakeIotbtConfirmingBleakClient()
+    client = LightClient(FakeDevice(), client_factory=lambda _device: fake)  # type: ignore[arg-type]
+    async with client:
+        await client.probe(allow_writes=True, response_timeout=0.5)
+        # Simulate the device persisting a red at ~50% brightness.
+        # Hue=0, sat=100, bright=50 -> rgb ~(128, 0, 0), brightness ~128.
+        fake._commanded_state = bytes.fromhex(
+            "ea810100aa0923240150f0006432006405001dffffffff01000000"
+        )
+        await client.set_rgb(128, 0, 0, brightness=50)
+        assert client.state is not None
+        assert not client.state.assumed
 
 
 @pytest.mark.asyncio
@@ -217,3 +268,29 @@ async def test_replay_rejects_missing_characteristic() -> None:
     async with client:
         with pytest.raises(ValueError, match="must name a characteristic"):
             await client.replay(records, allow_raw_write=True)
+
+
+def test_assumed_rgb_replaces_stale_polled_color_mode() -> None:
+    state = LightState(
+        power=True,
+        rgb=(255, 255, 255),
+        brightness=255,
+        white=255,
+    )
+
+    result = apply_assumed_rgb(state, (255, 0, 0), 128)
+
+    assert result.power is True
+    assert result.rgb == (255, 0, 0)
+    assert result.brightness == 128
+    assert result.white == 0
+    assert result.assumed is True
+
+
+def test_polled_state_is_not_assumed_without_local_rgb() -> None:
+    state = LightState(power=True, rgb=(255, 255, 255), brightness=255, white=255)
+
+    result = apply_assumed_rgb(state, None, None)
+
+    assert result.white == 255
+    assert result.assumed is False

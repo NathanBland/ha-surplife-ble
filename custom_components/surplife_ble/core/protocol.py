@@ -41,6 +41,13 @@ IOTBT_CMD_TELINK_PREFIX = 0xE2
 IOTBT_CMD_TELINK_OP = 0x0B
 IOTBT_CMD_FILLER = 0x1E
 
+# E1 03 app-style segment color command (verified on DX23012, 2026-08-26).
+# See docs/DX23012_PROTOCOL_FINDINGS.md.
+IOTBT_CMD_E1_PREFIX = 0xE1
+IOTBT_CMD_E1_SEGMENT_OP = 0x03
+IOTBT_CMD_E1_SEGMENT_RECORD = 0xA1
+IOTBT_SEGMENT_COUNT = 20
+
 
 @dataclass(frozen=True, slots=True)
 class ProbeFrame:
@@ -478,6 +485,56 @@ def iotbt_e2_rgb(red: int, green: int, blue: int, brightness: int) -> bytes:
     level = max(0, min(31, level))
     brightness_byte = IOTBT_CMD_E0_PREFIX | level
     return bytes((IOTBT_CMD_TELINK_PREFIX, IOTBT_CMD_TELINK_OP, hue & 0xFF, brightness_byte))
+
+
+def iotbt_e1_segment_rgb(
+    red: int,
+    green: int,
+    blue: int,
+    brightness: int,
+    *,
+    segment_count: int = IOTBT_SEGMENT_COUNT,
+) -> bytes:
+    """Build the verified E1 03 app-style segment color command.
+
+    The Android Surplife app sends this segmented HSV command to FF01. The
+    DX23012 lamp persists the new color in its EA 81 state, unlike the older
+    3B A1 command which only changes the physical output.
+
+    Format:
+      E1 03 00 <segment_count> 00 00 <segment_count>
+      followed by ``segment_count`` copies of ``A1 <hue> <sat> <bright>``.
+
+    Hue uses the 0-180 (half degrees) scale that matches the EA 81 state
+    layout. Saturation and brightness are 0-100 percent.
+
+    Verified on the physical DX23012 (IOTBT144) on 2026-08-26 with 20
+    segments and the 0x0A transport family. See
+    docs/DX23012_PROTOCOL_FINDINGS.md.
+    """
+    if not 1 <= segment_count <= 255:
+        raise ValueError("segment_count must be between 1 and 255")
+    h, s, _v = colorsys.rgb_to_hsv(
+        clamp(red, 0, 255) / 255,
+        clamp(green, 0, 255) / 255,
+        clamp(blue, 0, 255) / 255,
+    )
+    hue = round(h * 180) & 0xFF
+    saturation = clamp(round(s * 100), 0, 100)
+    level = clamp(brightness, 0, 100)
+    header = bytes(
+        (
+            IOTBT_CMD_E1_PREFIX,
+            IOTBT_CMD_E1_SEGMENT_OP,
+            0x00,
+            segment_count & 0xFF,
+            0x00,
+            0x00,
+            segment_count & 0xFF,
+        )
+    )
+    record = bytes((IOTBT_CMD_E1_SEGMENT_RECORD, hue, saturation, level))
+    return header + record * segment_count
 
 
 def extended_e0_white(brightness: int) -> bytes:

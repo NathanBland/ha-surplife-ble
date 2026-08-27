@@ -17,6 +17,7 @@ from custom_components.surplife_ble.core.protocol import (
     iotbt_3b_white,
     iotbt_e0_rgb,
     iotbt_e0_white,
+    iotbt_e1_segment_rgb,
     iotbt_power,
     parse_state,
     probe_frames,
@@ -284,3 +285,85 @@ def test_iotbt_3b_brightness_encodes_value() -> None:
     # value at positions 4 and 6
     assert cmd[4] == 60
     assert cmd[6] == 60
+
+
+# ---------------------------------------------------------------------------
+# E1 03 segment color command (verified on physical DX23012, 2026-08-26)
+# ---------------------------------------------------------------------------
+
+# Verified frame: blue at 40% brightness, 20 segments.
+# Header: E1 03 00 14 00 00 14
+# Record: A1 78 64 28  (hue=120, sat=100, bright=40)
+E1_03_BLUE_40 = (
+    bytes.fromhex("e1030014000014")
+    + bytes.fromhex("a1786428") * 20
+)
+
+
+def test_iotbt_e1_segment_rgb_matches_verified_blue_40_frame() -> None:
+    cmd = iotbt_e1_segment_rgb(0, 0, 255, 40)
+    assert cmd == E1_03_BLUE_40
+
+
+def test_iotbt_e1_segment_rgb_header_is_correct() -> None:
+    cmd = iotbt_e1_segment_rgb(255, 0, 0, 100)
+    assert cmd[0] == 0xE1
+    assert cmd[1] == 0x03
+    assert cmd[2] == 0x00
+    assert cmd[3] == 20  # segment count
+    assert cmd[4] == 0x00
+    assert cmd[5] == 0x00
+    assert cmd[6] == 20  # segment count repeated
+
+
+def test_iotbt_e1_segment_rgb_frame_length() -> None:
+    # 7-byte header + 20 * 4-byte records = 87 bytes.
+    cmd = iotbt_e1_segment_rgb(255, 0, 0, 100)
+    assert len(cmd) == 87
+
+
+def test_iotbt_e1_segment_rgb_records_repeat_segment_count_times() -> None:
+    cmd = iotbt_e1_segment_rgb(255, 0, 0, 100)
+    body = cmd[7:]
+    assert len(body) == 20 * 4
+    # Every 4-byte record starts with A1.
+    for i in range(0, len(body), 4):
+        assert body[i] == 0xA1
+
+
+def test_iotbt_e1_segment_rgb_red_hue_is_zero() -> None:
+    cmd = iotbt_e1_segment_rgb(255, 0, 0, 50)
+    record = cmd[7:11]
+    assert record[0] == 0xA1
+    assert record[1] == 0  # hue=0 for red
+    assert record[2] == 100  # saturation=100%
+    assert record[3] == 50  # brightness=50%
+
+
+def test_iotbt_e1_segment_rgb_blue_hue_is_120() -> None:
+    # Blue is hue 240 degrees -> 120 in the 0-180 scale.
+    cmd = iotbt_e1_segment_rgb(0, 0, 255, 100)
+    record = cmd[7:11]
+    assert record[1] == 120
+
+
+def test_iotbt_e1_segment_rgb_white_is_saturation_zero() -> None:
+    cmd = iotbt_e1_segment_rgb(255, 255, 255, 80)
+    record = cmd[7:11]
+    assert record[1] == 0  # hue=0
+    assert record[2] == 0  # saturation=0 for white
+    assert record[3] == 80  # brightness=80%
+
+
+def test_iotbt_e1_segment_rgb_rejects_invalid_segment_count() -> None:
+    with pytest.raises(ValueError):
+        iotbt_e1_segment_rgb(255, 0, 0, 100, segment_count=0)
+    with pytest.raises(ValueError):
+        iotbt_e1_segment_rgb(255, 0, 0, 100, segment_count=256)
+
+
+def test_iotbt_e1_segment_rgb_clamps_brightness() -> None:
+    cmd = iotbt_e1_segment_rgb(255, 0, 0, 200)
+    assert cmd[10] == 100  # clamped to 100
+    cmd_low = iotbt_e1_segment_rgb(255, 0, 0, -5)
+    assert cmd_low[10] == 0  # clamped to 0

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -17,7 +18,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .const import UPDATE_INTERVAL
 from .core.client import LightClient
-from .core.models import LightState
+from .core.models import LightState, apply_assumed_rgb
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -47,6 +48,9 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
         self._ble_device: BLEDevice | None = None
         self._advertisement: AdvertisementData | None = None
         self._was_available: bool = False
+        self._operation_lock = asyncio.Lock()
+        self._assumed_rgb: tuple[int, int, int] | None = None
+        self._assumed_rgb_brightness: int | None = None
 
     def async_set_ble_device(
         self, device: BLEDevice, advertisement: AdvertisementData | None
@@ -88,17 +92,22 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
 
     async def _async_update_data(self) -> LightState:
         try:
-            client = await self._async_get_client()
-            state = await client.query_state()
-            if state is None:
-                raise UpdateFailed("device did not return a supported state frame")
-            if not client.resolution or not client.resolution.repeatable:
-                raise UpdateFailed("device state response could not be repeated")
-            state.assumed = False
-            if not self._was_available:
-                _LOGGER.info("Surplife BLE device %s is now available", self.address)
-                self._was_available = True
-            return state
+            async with self._operation_lock:
+                client = await self._async_get_client()
+                state = await client.query_state()
+                if state is None:
+                    raise UpdateFailed("device did not return a supported state frame")
+                if not client.resolution or not client.resolution.repeatable:
+                    raise UpdateFailed("device state response could not be repeated")
+                state = apply_assumed_rgb(
+                    state,
+                    self._assumed_rgb,
+                    self._assumed_rgb_brightness,
+                )
+                if not self._was_available:
+                    _LOGGER.info("Surplife BLE device %s is now available", self.address)
+                    self._was_available = True
+                return state
         except UpdateFailed:
             if self._was_available:
                 _LOGGER.warning("Surplife BLE device %s is unavailable", self.address)
@@ -106,40 +115,61 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
             if self.client:
                 await self.client.disconnect()
             raise
-        except BaseException as err:
-            # Catch BaseException to include CancelledError from ESPHome proxy
-            # timeouts. Disconnect the client and wrap as UpdateFailed so the
-            # coordinator can retry on the next update interval.
+        except Exception as err:
             if self._was_available:
                 _LOGGER.warning("Surplife BLE device %s is unavailable: %s", self.address, err)
                 self._was_available = False
             if self.client:
                 try:
                     await self.client.disconnect()
-                except BaseException:
+                except Exception:
                     pass
             raise UpdateFailed(str(err)) from err
 
-    async def _async_command(self, method: str, *args: Any, **kwargs: Any) -> None:
-        client = await self._async_get_client()
-        if not client.resolution or not client.resolution.repeatable:
-            await client.query_state()
-        command = getattr(client, method)
-        await command(*args, **kwargs)
-        assert client.state is not None
-        self.async_set_updated_data(client.state)
+    async def _async_command(self, method: str, *args: Any, **kwargs: Any) -> LightState:
+        async with self._operation_lock:
+            client = await self._async_get_client()
+            if not client.resolution or not client.resolution.repeatable:
+                await client.query_state()
+            command = getattr(client, method)
+            await command(*args, **kwargs)
+            assert client.state is not None
+            self.async_set_updated_data(client.state)
+            return client.state
 
     async def async_set_power(self, turn_on: bool) -> None:
         await self._async_command("set_power", turn_on)
 
     async def async_set_rgb(self, rgb: tuple[int, int, int], brightness: int) -> None:
-        await self._async_command("set_rgb", *rgb, brightness=max(1, round(brightness / 255 * 100)))
+        state = await self._async_command(
+            "set_rgb", *rgb, brightness=max(1, round(brightness / 255 * 100))
+        )
+        if state.assumed:
+            self._assumed_rgb = state.rgb
+            self._assumed_rgb_brightness = state.brightness
+        else:
+            self._assumed_rgb = None
+            self._assumed_rgb_brightness = None
 
     async def async_set_white(self, brightness: int) -> None:
         await self._async_command("set_white", max(1, round(brightness / 255 * 100)))
+        self._assumed_rgb = None
+        self._assumed_rgb_brightness = None
 
     async def async_set_brightness(self, brightness: int) -> None:
-        await self._async_command("set_brightness", max(1, round(brightness / 255 * 100)))
+        state = await self._async_command(
+            "set_brightness", max(1, round(brightness / 255 * 100))
+        )
+        if state.assumed:
+            if state.white:
+                self._assumed_rgb = None
+                self._assumed_rgb_brightness = None
+            else:
+                self._assumed_rgb = state.rgb
+                self._assumed_rgb_brightness = state.brightness
+        else:
+            self._assumed_rgb = None
+            self._assumed_rgb_brightness = None
 
     async def async_disconnect(self) -> None:
         if self.client:

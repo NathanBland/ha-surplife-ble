@@ -34,8 +34,7 @@ from .protocol import (
     extended_e0_white,
     extended_zone_power_off,
     frame_for_transport,
-    iotbt_3b_rgb,
-    iotbt_3b_white,
+    iotbt_e1_segment_rgb,
     iotbt_power,
     original_power,
     parse_state,
@@ -491,8 +490,16 @@ class LightClient:
             )
             await self._send_inner(payload, probe.transport, note="set rgb")
         elif resolution.codec == "iotbt-ea81":
-            payload = iotbt_3b_rgb(red, green, blue, brightness)
-            await self._send_inner(payload, probe.transport, note="set rgb")
+            # Use the verified E1 03 segment command, which updates the
+            # lamp's persisted EA 81 state. The older 3B A1 command only
+            # changes the physical output and leaves stale state.
+            payload = iotbt_e1_segment_rgb(red, green, blue, brightness)
+            await self._send_inner(payload, probe.transport, note="set rgb e1 03")
+            await self._confirm_command_state(
+                expected_rgb=(red, green, blue),
+                expected_brightness=round(brightness * 255 / 100),
+            )
+            return
         elif experimental_e122:
             if "candidate-e122" not in resolution.capabilities:
                 raise RuntimeError("E1 22 is only enabled for a matching extended candidate")
@@ -514,6 +521,54 @@ class LightClient:
             assumed=True,
         )
 
+    async def _confirm_command_state(
+        self,
+        *,
+        expected_rgb: tuple[int, int, int] | None = None,
+        expected_brightness: int | None = None,
+        expected_white: int | None = None,
+    ) -> None:
+        """Query EA 81 state after a command and reconcile assumed state.
+
+        If the device reports a state that matches the command, mark the
+        state as confirmed (assumed=False). Otherwise keep the commanded
+        values as assumed so the UI does not flicker to a stale reading.
+        """
+        resolution = self.resolution
+        if resolution is None:
+            return
+        confirmed = await self.query_state()
+        if confirmed is None:
+            self.state = self.state or LightState()
+            self.state.assumed = True
+            return
+        if resolution.codec == "iotbt-ea81":
+            matched = True
+            if expected_rgb is not None and confirmed.rgb is not None:
+                # The EA 81 HSV round-trip is lossy. Accept a close match.
+                matched = all(
+                    abs(a - b) <= 12
+                    for a, b in zip(expected_rgb, confirmed.rgb, strict=False)
+                )
+            if expected_brightness is not None and confirmed.brightness is not None:
+                matched = matched and abs(expected_brightness - confirmed.brightness) <= 16
+            if expected_white is not None:
+                matched = matched and abs(expected_white - (confirmed.white or 0)) <= 16
+            if matched:
+                confirmed.assumed = False
+            else:
+                # Keep the commanded values as assumed state.
+                if expected_rgb is not None:
+                    confirmed.rgb = expected_rgb
+                if expected_brightness is not None:
+                    confirmed.brightness = expected_brightness
+                if expected_white is not None:
+                    confirmed.white = expected_white
+                confirmed.assumed = True
+        else:
+            confirmed.assumed = True
+        self.state = confirmed
+
     async def set_white(
         self,
         brightness: int,
@@ -530,8 +585,15 @@ class LightClient:
             )
             await self._send_inner(payload, probe.transport, note="set white")
         elif resolution.codec == "iotbt-ea81":
-            payload = iotbt_3b_white(brightness)
-            await self._send_inner(payload, probe.transport, note="set white")
+            # White is HSV with saturation 0. The E1 03 segment command
+            # persists this in the EA 81 state.
+            payload = iotbt_e1_segment_rgb(255, 255, 255, brightness)
+            await self._send_inner(payload, probe.transport, note="set white e1 03")
+            await self._confirm_command_state(
+                expected_white=white_byte,
+                expected_brightness=white_byte,
+            )
+            return
         elif experimental_e122:
             if "candidate-e122" not in resolution.capabilities:
                 raise RuntimeError("E1 22 is only enabled for a matching extended candidate")
