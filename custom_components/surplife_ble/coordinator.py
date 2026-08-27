@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -112,27 +113,39 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
             if self._was_available:
                 _LOGGER.warning("Surplife BLE device %s is unavailable", self.address)
                 self._was_available = False
-            if self.client:
-                await self.client.disconnect()
+            # Do not disconnect on transient errors. The bleak_retry_connector
+            # will reconnect on the next attempt. Disconnecting here forces a
+            # full reconnect (discover, subscribe, probe) on every poll failure,
+            # which makes commands slow.
             raise
         except Exception as err:
             if self._was_available:
                 _LOGGER.warning("Surplife BLE device %s is unavailable: %s", self.address, err)
                 self._was_available = False
-            if self.client:
-                try:
-                    await self.client.disconnect()
-                except Exception:
-                    pass
+            # Do not disconnect on transient errors. Let the next poll or
+            # command retry with the existing connection state.
             raise UpdateFailed(str(err)) from err
 
     async def _async_command(self, method: str, *args: Any, **kwargs: Any) -> LightState:
         async with self._operation_lock:
-            client = await self._async_get_client()
-            if not client.resolution or not client.resolution.repeatable:
-                await client.query_state()
-            command = getattr(client, method)
-            await command(*args, **kwargs)
+            try:
+                client = await self._async_get_client()
+                if not client.resolution or not client.resolution.repeatable:
+                    await client.query_state()
+                command = getattr(client, method)
+                await command(*args, **kwargs)
+            except Exception as err:
+                # The connection may have dropped silently. Disconnect,
+                # reconnect, and retry the command once.
+                _LOGGER.debug("Command %s failed, retrying: %s", method, err)
+                if self.client:
+                    with suppress(Exception):
+                        await self.client.disconnect()
+                client = await self._async_get_client()
+                if not client.resolution or not client.resolution.repeatable:
+                    await client.query_state()
+                command = getattr(client, method)
+                await command(*args, **kwargs)
             assert client.state is not None
             self.async_set_updated_data(client.state)
             return client.state
@@ -141,6 +154,7 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
         await self._async_command("set_power", turn_on)
 
     async def async_set_rgb(self, rgb: tuple[int, int, int], brightness: int) -> None:
+        brightness = brightness or 255
         state = await self._async_command(
             "set_rgb", *rgb, brightness=max(1, round(brightness / 255 * 100))
         )
@@ -152,11 +166,13 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
             self._assumed_rgb_brightness = None
 
     async def async_set_white(self, brightness: int) -> None:
+        brightness = brightness or 255
         await self._async_command("set_white", max(1, round(brightness / 255 * 100)))
         self._assumed_rgb = None
         self._assumed_rgb_brightness = None
 
     async def async_set_brightness(self, brightness: int) -> None:
+        brightness = brightness or 255
         state = await self._async_command(
             "set_brightness", max(1, round(brightness / 255 * 100))
         )
