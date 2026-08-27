@@ -13,7 +13,8 @@ It supports the MIHEAL DX23012 floor lamp and similar devices that use the IOTBT
 | Power on and off | Verified |
 | RGB color | Verified |
 | White brightness | Verified |
-| Overall brightness | Working |
+| Overall brightness | Verified |
+| State confirmation | Verified |
 | Multiple devices | Supported |
 | Automatic discovery | Supported |
 | Manual setup | Supported |
@@ -58,17 +59,17 @@ Configure the integration through the UI:
 
 ## Known limitations
 
-**RGB color state is assumed.**
+**Color state may show as "assumed" on the first command.**
 
-The device does not report RGB color changes back to Home Assistant.
-The integration shows the last color you set, not the actual device state.
-This is a firmware limitation. The vendor app uses a write method that only Android permits.
-Home Assistant, macOS, and ESPHome do not permit this method.
+The integration sends a color command and then queries the device state.
+If the device confirms the new color, the state shows as confirmed.
+If the device does not respond in time, the state shows as "assumed".
+The next successful poll replaces the assumed state with the real device state.
 
 **Use one controller at a time.**
 
-If you change the lamp with the physical button or another app, Home Assistant will not detect the color change.
-Power and white brightness still update on the next poll.
+The lamp accepts one active BLE controller at a time.
+If you change the lamp with the physical button or the vendor app, Home Assistant will detect the change on the next poll.
 
 **Brightness in color mode sends the full color command again.**
 
@@ -87,19 +88,22 @@ The integration resends the current color with the new brightness value.
 ### Commands do not work
 
 - Power on and power off should always work. If they do not, make sure the device is connected.
-- Color changes work. The state can show as "assumed". This is expected.
+- Color changes work. The integration confirms the new color with the device after each command.
+- If the state shows as "assumed", the device did not confirm the change in time. The next poll will correct it.
 - If the light does not respond, power cycle it. Then reload the integration.
 
 ### State shows the wrong color after a restart
 
-This is a known limitation. The device does not report color changes back to Home Assistant.
-Send a color command from Home Assistant to correct the display.
+The integration queries the device state on startup.
+If the device is not reachable, the state stays empty until the next successful poll.
+Send a color command from Home Assistant to update the display immediately.
 
 ## Development
 
 This repository includes a standalone `ble-rgb` command-line tool.
 Use it to investigate the protocol and to debug.
 For protocol details, GATT characteristics, and command formats, see [docs/CAPTURE_WORKFLOW.md](docs/CAPTURE_WORKFLOW.md).
+For the verified DX23012 command findings, see [docs/DX23012_PROTOCOL_FINDINGS.md](docs/DX23012_PROTOCOL_FINDINGS.md).
 
 Install the development environment:
 
