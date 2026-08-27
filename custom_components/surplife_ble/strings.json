@@ -1,0 +1,30 @@
+{
+  "config": {
+    "abort": {
+      "already_configured": "This device is already configured."
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the device.",
+      "device_not_found": "Device not found. Make sure it is powered on and in range.",
+      "unknown": "An unknown error occurred."
+    },
+    "step": {
+      "user": {
+        "title": "Select a Surplife BLE light",
+        "description": "Choose a discovered device from the list, or select manual entry.",
+        "data": {
+          "address": "Device",
+          "name": "Name"
+        }
+      },
+      "manual": {
+        "title": "Add a Surplife BLE light manually",
+        "description": "Enter the Bluetooth address (MAC or UUID) of your device. You can find it with a BLE scanner app or the ble-rgb scan command.",
+        "data": {
+          "address": "Bluetooth address",
+          "name": "Name"
+        }
+      }
+    }
+  }
+}
