@@ -92,6 +92,23 @@ class FakeEntry:
     data = {"address": "DEVICE"}
 
 
+def test_current_ble_device_uses_home_assistant_best_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_coordinator(monkeypatch)
+    coordinator = module.SurplifeCoordinator(FakeHass(), FakeEntry())
+    cached = object()
+    current = object()
+    coordinator._ble_device = cached
+    monkeypatch.setattr(
+        module.bluetooth,
+        "async_ble_device_from_address",
+        lambda *_args, **_kwargs: current,
+    )
+
+    assert coordinator._current_ble_device() is current
+
+
 @pytest.mark.asyncio
 async def test_assumed_rgb_is_cleared_when_poll_confirms_state(
     monkeypatch: pytest.MonkeyPatch,

@@ -51,7 +51,9 @@ async def _validate_device(hass: HomeAssistant, address: str) -> str | None:
             address,
             lambda _c: None,
             use_services_cache=True,
-            ble_device_callback=lambda: ble_device,
+            ble_device_callback=lambda: (
+                bluetooth.async_ble_device_from_address(hass, address, True) or ble_device
+            ),
             timeout=_VALIDATE_TIMEOUT,
         )
     except TimeoutError:

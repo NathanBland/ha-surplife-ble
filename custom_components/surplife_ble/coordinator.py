@@ -67,6 +67,17 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
         if self.client:
             self.client.set_ble_device(device, advertisement)
 
+    def _current_ble_device(self, fallback: BLEDevice | None = None) -> BLEDevice | None:
+        return (
+            bluetooth.async_ble_device_from_address(
+                self.hass,
+                self.address.upper(),
+                True,
+            )
+            or self._ble_device
+            or fallback
+        )
+
     async def _async_client_factory(self, device: BLEDevice) -> BleakClientWithServiceCache:
         """Use Home Assistant's retrying connection helper and service cache."""
         return await establish_connection(
@@ -77,14 +88,12 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
                 self.client.mark_disconnected(disconnected) if self.client else None
             ),
             use_services_cache=True,
-            ble_device_callback=lambda: self._ble_device or device,
+            ble_device_callback=lambda: self._current_ble_device(device) or device,
         )
 
     async def _async_get_client(self) -> LightClient:
-        if self._ble_device is None:
-            self._ble_device = bluetooth.async_ble_device_from_address(
-                self.hass, self.address.upper(), True
-            )
+        if current_device := self._current_ble_device():
+            self._ble_device = current_device
         if self._ble_device is None:
             raise UpdateFailed(f"Bluetooth device {self.address} is not currently reachable")
         if self.client is None:
