@@ -1,0 +1,28 @@
+{
+  "classic_floor_lamp": {
+    "source": "flux_led model 0x0E layout",
+    "authoritative_for_dx23012": false,
+    "state_hex": "810e23610010ff0000000900f01b"
+  },
+  "extended_b6": {
+    "source": "flux_led PR #539 real extended-state fixture",
+    "authoritative_for_dx23012": false,
+    "state_hex": "ea810100b60924660164f000000000640500640000002002010003"
+  },
+  "extended_unknown_77": {
+    "source": "flux_led PR #555 real extended-state fixture",
+    "authoritative_for_dx23012": false,
+    "state_hex": "ea810100770923250350f00be46400000100640000008003000000"
+  },
+  "dx23012_iotbt144": {
+    "source": "physical DX23012 capture 2026-08-26",
+    "authoritative_for_dx23012": true,
+    "wrapped_response_hex": "041e8000004d4e0a7b22636f6465223a302c227061796c6f6164223a22454138313031303041413039323332353646353046303030363436343030363430353030314446464646464646463031303030303030227d",
+    "state_hex": "ea810100aa0923256f50f0006464006405001dffffffff01000000"
+  },
+  "e122_uniform_red": {
+    "source": "flux_led PR #544 open hardware-verified packet",
+    "authoritative_for_dx23012": false,
+    "inner_hex": "e122000000001400646400000064640000006464000000646400000064640000006464000000646400000064640000006464000000646400000064640000006464000000646400000064640000006464000000646400000064640000006464000000646400000064640000"
+  }
+}
