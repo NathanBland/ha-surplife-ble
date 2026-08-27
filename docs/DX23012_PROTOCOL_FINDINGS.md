@@ -32,9 +32,12 @@ These corrections showed the captured traffic from the Android app was a sequenc
 
 - State frames use the `EA 81` prefix.
 - The full state frame is 27 bytes.
+- Bytes 3 and 4 contain a mesh address. Do not use them as a fixed device signature.
+- Byte 5 identifies the verified IOTBT state layout as `0x09`.
 - Byte 6 is power: `0x23` means on, `0x24` means off.
-- Byte 11 is hue on a `0` to `180` scale.
-- Byte 12 is saturation.
+- Bytes 11 and 12 contain packed hue and saturation.
+- Hue is the packed value shifted right by seven bits.
+- Saturation is the low seven bits of the packed value.
 - Byte 13 is brightness.
 - Color and white modes are distinguished by the white-state field, not by a zero RGB value.
 
@@ -51,9 +54,11 @@ These corrections showed the captured traffic from the Android app was a sequenc
 
 The Android app sends a segmented color command.
 
-- The command family for this DX23012 is `0x0A`.
+- The Android capture from `IOTBT144` used command family `0x0A`.
+- Hardware tests show that command family `0x0B` works on both test lamps.
+- `IOTBT04F` disconnects and ignores the segment command with family `0x0A`.
 - The header is `E1 03 00 <segment_count> 00 00 <segment_count>`.
-- Each segment record is `A1 <hue> <saturation> <brightness>`.
+- Each segment record is `A1 <packed_hs_high> <packed_hs_low> <brightness>`.
 - The tested lamp uses 20 segments.
 - A blue at 40% brightness used 20 copies of `A1 78 64 28`.
 - This produced a 95-byte framed write. That size is below the MTU limit.
@@ -93,11 +98,13 @@ Each step was not tested in isolation, so this is the current hypothesis.
 ## 7. Implementation status
 
 The integration now uses `E1 03` for RGB color and RGB brightness on the verified DX23012 state signature.
-It uses the captured `0x0A` transport family and 20 segment records.
+It uses transport family `0x0B` and 20 segment records for RGB commands.
+State queries continue to use the resolved probe transport.
 It subscribes to notifications before each command session.
-It accepts a matching notification for 0.2 seconds after an RGB command.
-It then returns control to Home Assistant.
-It delays the background refresh for 0.3 seconds and combines rapid command updates.
+It waits 0.15 seconds for a matching notification after an RGB command.
+It then sends up to two short state queries to complete the required command round trip.
+A typical connected state query completes in less than 50 ms.
+It requests a background refresh only when the bounded confirmation fails.
 The assumed RGB state expires after five seconds.
 The next matching poll confirms the state before expiration.
 
@@ -105,18 +112,33 @@ The integration continues to use the legacy `3B B1` candidate for dedicated whit
 The dedicated white command still requires a hardware retest.
 An `E1 03` command with zero saturation is not verified as a dedicated white command.
 
-## 8. Remaining validation
+## 8. Performance test results
 
-1. Test RGB commands on the second lamp.
-2. Test dedicated white mode after an RGB command.
-3. Test RGB mode after a white command.
-4. Test through an ESPHome Bluetooth proxy.
-5. Test through a direct USB Bluetooth adapter.
-6. Confirm notification registration after an unexpected disconnect.
-7. Measure rapid slider updates with the Home Assistant interface.
-8. Keep `3B A1` as an experimental fallback until both lamps pass the tests.
+Tests used one persistent direct Bluetooth connection for each lamp.
+Each sequence used red, blue, green, purple, and two brightness changes.
 
-## 9. Safety
+`IOTBT04F` completed connected commands in 180 to 778 ms.
+Its later state polls completed in 41 to 156 ms.
+`IOTBT144` completed connected commands in 210 to 480 ms.
+Its later state polls completed in 39 to 69 ms.
+All final states matched purple at 90% brightness.
+Both connections stayed active during the corrected sequences.
+
+A burst without state queries failed on `IOTBT04F`.
+Only the first long segment command was committed.
+Thus, each segment command requires a state-query round trip before the next segment command.
+Initial connection and protocol resolution can take several seconds.
+
+## 9. Remaining validation
+
+1. Test dedicated white mode after an RGB command.
+2. Test RGB mode after a white command.
+3. Test through an ESPHome Bluetooth proxy.
+4. Confirm notification registration after an unexpected disconnect.
+5. Measure rapid slider updates with the Home Assistant interface.
+6. Keep `3B A1` as an experimental fallback until white-mode tests are complete.
+
+## 10. Safety
 
 - Use only the verified device for new tests.
 - Send reviewed application-level ATT writes one at a time.

@@ -40,7 +40,7 @@ def wrap_magichome(
     payload: bytes,
     sequence: int,
     *,
-    include_command_family: bool = True,
+    command_family: int = 0x0A,
     length_bias: int = 0,
 ) -> bytes:
     """Wrap an inner command in the observed MagicHome2 v0 BLE envelope.
@@ -55,7 +55,8 @@ def wrap_magichome(
     declared_length = len(payload) + length_bias
     if not 0 <= declared_length <= 0xFFFF:
         raise ValueError("framed payload is too long")
-    command_family = 0x0A if include_command_family else 0x0B
+    if not 0 <= command_family <= 0xFF:
+        raise ValueError("command_family must be between 0 and 255")
     return bytes((0, sequence)) + MAGIC_MARKER + declared_length.to_bytes(2, "big") + bytes(
         (len(payload) + 1, command_family)
     ) + payload

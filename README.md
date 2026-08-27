@@ -62,9 +62,9 @@ Configure the integration through the UI:
 
 **Color state may show as "assumed" on the first command.**
 
-The integration sends a color command immediately.
-It accepts a matching notification when the lamp sends one.
-Otherwise, it shows an assumed state and requests a background refresh.
+The integration sends a color command and completes a short state query.
+The query prepares the lamp for the next color or brightness command.
+If confirmation fails, the integration shows an assumed state and requests a background refresh.
 A matching poll confirms the state. The assumed state expires after five seconds.
 
 **Use one controller at a time.**
@@ -74,6 +74,11 @@ The integration keeps its connection open for faster commands.
 Each connected lamp uses one Bluetooth adapter or proxy connection slot.
 Close the vendor app before you control the lamp from Home Assistant.
 External changes appear after the assumed state expires and a poll succeeds.
+
+**The first connection can take several seconds.**
+
+The integration keeps a successful connection open.
+Tests measured later color and brightness commands at approximately 0.2 to 0.8 seconds.
 
 **Brightness in color mode sends the full color command again.**
 

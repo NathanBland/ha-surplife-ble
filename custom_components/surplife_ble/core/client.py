@@ -268,9 +268,15 @@ class LightClient:
         *,
         note: str,
         characteristic: GattCharacteristic | None = None,
+        command_family: int = 0x0A,
     ) -> None:
         await self._start_notifications()
-        framed = frame_for_transport(payload, transport, self._sequence.next())
+        framed = frame_for_transport(
+            payload,
+            transport,
+            self._sequence.next(),
+            command_family=command_family,
+        )
         await self._write(
             framed,
             characteristic=characteristic,
@@ -421,7 +427,12 @@ class LightClient:
             return self.resolution
         return None
 
-    async def query_state(self) -> LightState | None:
+    async def query_state(
+        self,
+        *,
+        response_timeout: float = 1.5,
+        allow_reads: bool = True,
+    ) -> LightState | None:
         """Refresh state with the resolved query path, probing when necessary."""
         if not self.connected:
             await self.connect()
@@ -435,7 +446,10 @@ class LightClient:
             self._probe_frame.transport,
             note="state refresh",
         )
-        result = await self._await_classification(1.5)
+        result = await self._await_classification(
+            response_timeout,
+            allow_reads=allow_reads,
+        )
         if result is None:
             return None
         resolution, state = result
@@ -512,7 +526,12 @@ class LightClient:
             payload = iotbt_e1_segment_rgb(red, green, blue, brightness)
             expected_brightness = round(brightness * 255 / 100)
             self._flush_notifications()
-            await self._send_inner(payload, probe.transport, note="set rgb e1 03")
+            await self._send_inner(
+                payload,
+                probe.transport,
+                note="set rgb e1 03",
+                command_family=0x0B,
+            )
             self.state = LightState(
                 power=True,
                 rgb=(red, green, blue),
@@ -522,7 +541,7 @@ class LightClient:
                 firmware_version=resolution.firmware_version,
                 assumed=True,
             )
-            await self._confirm_rgb_notification((red, green, blue), expected_brightness)
+            await self._confirm_rgb_state((red, green, blue), expected_brightness)
             return
         elif experimental_e122:
             if "candidate-e122" not in resolution.capabilities:
@@ -545,24 +564,36 @@ class LightClient:
             assumed=True,
         )
 
-    async def _confirm_rgb_notification(
+    async def _confirm_rgb_state(
         self,
         expected_rgb: tuple[int, int, int],
         expected_brightness: int,
     ) -> None:
-        """Accept a fresh state notification without delaying the command."""
-        result = await self._await_classification(0.2, allow_reads=False)
-        if result is None:
-            return
-        resolution, confirmed = result
-        resolution.repeatable = bool(self.resolution and self.resolution.repeatable)
-        resolution.transport = self.resolution.transport if self.resolution else None
-        self.resolution = resolution
-        if confirmed is not None and rgb_state_matches(
-            confirmed, expected_rgb, expected_brightness
-        ):
-            confirmed.assumed = False
-            self.state = confirmed
+        """Complete the state round trip required between segment writes."""
+        optimistic = self.state
+        result = await self._await_classification(0.15, allow_reads=False)
+        if result is not None:
+            resolution, confirmed = result
+            resolution.repeatable = bool(self.resolution and self.resolution.repeatable)
+            resolution.transport = self.resolution.transport if self.resolution else None
+            self.resolution = resolution
+            if confirmed is not None and rgb_state_matches(
+                confirmed, expected_rgb, expected_brightness
+            ):
+                confirmed.assumed = False
+                self.state = confirmed
+                return
+        for attempt in range(2):
+            confirmed = await self.query_state(response_timeout=0.75, allow_reads=False)
+            if confirmed is None:
+                break
+            if rgb_state_matches(confirmed, expected_rgb, expected_brightness):
+                confirmed.assumed = False
+                self.state = confirmed
+                return
+            if attempt == 0:
+                await asyncio.sleep(0.15)
+        self.state = optimistic
 
     async def set_white(
         self,

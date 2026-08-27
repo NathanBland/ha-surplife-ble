@@ -150,7 +150,10 @@ async def test_iotbt_set_rgb_uses_e1_03_segment_format() -> None:
         assert resolution.transport == "magichome2"
 
         await client.set_rgb(255, 0, 0, brightness=50)
-        sent = fake.writes[-1][1]
+        sent = next(
+            data for _uuid, data, _response in reversed(fake.writes) if data[8:10] == b"\xe1\x03"
+        )
+        assert sent[7] == 0x0B
         assert sent[8] == 0xE1
         assert sent[9] == 0x03
         assert client.state is not None
@@ -186,6 +189,7 @@ async def test_iotbt_set_brightness_resends_color_via_e1_03() -> None:
         # uses the E1 03 encoder. The E1 03 command is the first write of
         # this batch; the second is the confirmation query.
         sent = fake.writes[first_count][1]
+        assert sent[7] == 0x0B
         assert sent[8] == 0xE1
         assert sent[9] == 0x03
 
@@ -236,7 +240,9 @@ async def test_query_state_returns_none_without_a_fresh_response() -> None:
         await client.probe(allow_writes=True, response_timeout=0.5)
         fake.respond = False
 
-        async def no_response(_wait_seconds: float) -> None:
+        async def no_response(
+            _wait_seconds: float, *, allow_reads: bool = True
+        ) -> None:
             return None
 
         client._await_classification = no_response  # type: ignore[method-assign]
@@ -257,8 +263,11 @@ async def test_reconnect_subscribes_before_sending_control() -> None:
     await client.connect()
     await client.set_rgb(255, 0, 0, brightness=50)
 
+    sent = next(
+        data for _uuid, data, _response in second.writes if data[8:10] == b"\xe1\x03"
+    )
     assert second.notify.uuid in second.callbacks
-    assert second.writes[-1][1][8:10] == bytes.fromhex("e103")
+    assert sent[7] == 0x0B
     await client.disconnect()
 
 

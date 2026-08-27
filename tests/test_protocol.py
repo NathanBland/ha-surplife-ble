@@ -77,12 +77,32 @@ def test_extended_state_uses_frame_shape_not_registration(fixture_name: str, mod
 
 def test_unknown_ea81_layout_remains_control_locked() -> None:
     packet = bytearray(bytes.fromhex(FIXTURES["dx23012_iotbt144"]["state_hex"]))
-    packet[4:6] = bytes.fromhex("1234")
+    packet[5] = 0x34
     classified = classify_packet(bytes(packet))
     assert classified is not None
     resolution, _inner, _framing = classified
     assert resolution.codec == "unresolved-ea81"
     assert "rgb" not in resolution.capabilities
+
+
+def test_dx23012_mesh_address_does_not_change_codec() -> None:
+    packet = bytearray(bytes.fromhex(FIXTURES["dx23012_iotbt144"]["state_hex"]))
+    packet[3:5] = bytes.fromhex("1234")
+    classified = classify_packet(bytes(packet))
+    assert classified is not None
+    resolution, _inner, _framing = classified
+    assert resolution.codec == "iotbt-ea81"
+
+
+def test_dx23012_odd_hue_packed_bit_does_not_change_codec() -> None:
+    packet = bytes.fromhex("ea810100aa0923240150f00ee02f006405001dffffffff01000000")
+    classified = classify_packet(packet)
+    assert classified is not None
+    resolution, _inner, _framing = classified
+    assert resolution.codec == "iotbt-ea81"
+    state = parse_state(packet)
+    assert state is not None
+    assert state.rgb == (120, 60, 5)
 
 
 def test_physical_dx23012_json_response_is_authoritative() -> None:
@@ -350,11 +370,16 @@ def test_iotbt_e1_segment_rgb_red_hue_is_zero() -> None:
     assert record[3] == 50  # brightness=50%
 
 
-def test_iotbt_e1_segment_rgb_blue_hue_is_120() -> None:
-    # Blue is hue 240 degrees -> 120 in the 0-180 scale.
+def test_iotbt_e1_segment_rgb_blue_hue_is_240() -> None:
     cmd = iotbt_e1_segment_rgb(0, 0, 255, 100)
     record = cmd[7:11]
-    assert record[1] == 120
+    assert record[1:3] == bytes.fromhex("7864")
+
+
+def test_iotbt_e1_segment_rgb_preserves_odd_hue_bit() -> None:
+    cmd = iotbt_e1_segment_rgb(255, 123, 0, 100)
+    record = cmd[7:11]
+    assert record[1:3] == bytes.fromhex("0ee4")
 
 
 def test_iotbt_e1_segment_rgb_white_is_saturation_zero() -> None:

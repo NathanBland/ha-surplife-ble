@@ -110,10 +110,15 @@ def classify_packet(packet: bytes) -> tuple[ProtocolResolution, bytes, str] | No
                 capabilities.update({"rgb", "brightness", "candidate-white"})
             elif (
                 len(candidate) >= 27
-                and candidate[4:6] == b"\xaa\x09"
+                and candidate[5] == 0x09
                 and candidate[IOTBT_POS_COLOR_WHITE_MODE]
                 in (IOTBT_COLOR_MODE, IOTBT_WHITE_MODE)
-                and candidate[IOTBT_POS_SATURATION] <= 100
+                and (
+                    (candidate[IOTBT_POS_HUE] << 8 | candidate[IOTBT_POS_SATURATION])
+                    >> 7
+                )
+                < 360
+                and (candidate[IOTBT_POS_SATURATION] & 0x7F) <= 100
                 and candidate[IOTBT_POS_BRIGHTNESS] <= 100
             ):
                 model_num = None
@@ -208,10 +213,9 @@ def parse_state(packet: bytes) -> LightState | None:
                 raw_hex=state.hex(),
             )
         if resolution.codec == "iotbt-ea81":
-            # IOTBT DX23012: HSV at pos 11/12/13, color/white mode at pos 7-8.
-            # Hue is 0-180 (half degrees), saturation and brightness are 0-100.
-            hue = clamp(state[IOTBT_POS_HUE], 0, 180) * 2 / 360
-            saturation = clamp(state[IOTBT_POS_SATURATION], 0, 100) / 100
+            packed_hs = state[IOTBT_POS_HUE] << 8 | state[IOTBT_POS_SATURATION]
+            hue = clamp(packed_hs >> 7, 0, 359) / 360
+            saturation = clamp(packed_hs & 0x7F, 0, 100) / 100
             value = clamp(state[IOTBT_POS_BRIGHTNESS], 0, 100) / 100
             red_f, green_f, blue_f = colorsys.hsv_to_rgb(hue, saturation, value)
             is_white_mode = state[IOTBT_POS_COLOR_WHITE_MODE] == IOTBT_WHITE_MODE
@@ -518,8 +522,8 @@ def iotbt_e1_segment_rgb(
       E1 03 00 <segment_count> 00 00 <segment_count>
       followed by ``segment_count`` copies of ``A1 <hue> <sat> <bright>``.
 
-    Hue uses the 0-180 (half degrees) scale that matches the EA 81 state
-    layout. Saturation and brightness are 0-100 percent.
+    Hue and saturation use a packed 16-bit field. Saturation uses the low
+    seven bits. Brightness uses a separate 0-100 percent byte.
 
     Verified on the physical DX23012 (IOTBT144) on 2026-08-26 with 20
     segments and the 0x0A transport family. See
@@ -532,8 +536,9 @@ def iotbt_e1_segment_rgb(
         clamp(green, 0, 255) / 255,
         clamp(blue, 0, 255) / 255,
     )
-    hue = round(h * 180) & 0xFF
+    hue = round(h * 360) % 360
     saturation = clamp(round(s * 100), 0, 100)
+    packed_hs = hue << 7 | saturation
     level = clamp(brightness, 0, 100)
     header = bytes(
         (
@@ -546,7 +551,14 @@ def iotbt_e1_segment_rgb(
             segment_count & 0xFF,
         )
     )
-    record = bytes((IOTBT_CMD_E1_SEGMENT_RECORD, hue, saturation, level))
+    record = bytes(
+        (
+            IOTBT_CMD_E1_SEGMENT_RECORD,
+            (packed_hs >> 8) & 0xFF,
+            packed_hs & 0xFF,
+            level,
+        )
+    )
     return header + record * segment_count
 
 
@@ -581,11 +593,22 @@ def experimental_e122_fill(
     return bytes.fromhex("e1220000000014") + record * 20
 
 
-def frame_for_transport(payload: bytes, transport: str, sequence: int) -> bytes:
+def frame_for_transport(
+    payload: bytes,
+    transport: str,
+    sequence: int,
+    *,
+    command_family: int = 0x0A,
+) -> bytes:
     if transport == "raw":
         return payload
     if transport == "magichome2":
-        return wrap_magichome(payload, sequence)
+        return wrap_magichome(payload, sequence, command_family=command_family)
     if transport == "magichome2-len-plus-2":
-        return wrap_magichome(payload, sequence, length_bias=2)
+        return wrap_magichome(
+            payload,
+            sequence,
+            command_family=command_family,
+            length_bias=2,
+        )
     raise ValueError(f"unsupported transport: {transport}")

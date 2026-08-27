@@ -23,9 +23,11 @@ def test_magichome_wrappers_are_explicit() -> None:
     inner = bytes.fromhex("ea818a8b")
     standard = wrap_magichome(inner, 3)
     plus_two = wrap_magichome(inner, 4, length_bias=2)
+    family_0b = wrap_magichome(inner, 5, command_family=0x0B)
 
     assert standard.hex() == "000380000004050aea818a8b"
     assert plus_two.hex() == "000480000006050aea818a8b"
+    assert family_0b.hex() == "000580000004050bea818a8b"
     assert unwrap_magichome(standard) == (inner, "magichome2:length_delta=0")
     assert unwrap_magichome(plus_two) == (inner, "magichome2:length_delta=2")
     assert any(payload == inner for payload, _description in candidate_payloads(standard))
