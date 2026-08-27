@@ -14,12 +14,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     from homeassistant.components import bluetooth
     from homeassistant.const import CONF_ADDRESS, Platform
     from homeassistant.core import callback
+    from homeassistant.helpers.update_coordinator import UpdateFailed
 
     from .coordinator import SurplifeCoordinator, SurplifeRuntimeData
 
     address = entry.data[CONF_ADDRESS]
     coordinator = SurplifeCoordinator(hass, entry)
-    await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = SurplifeRuntimeData(coordinator=coordinator)
 
     @callback
@@ -37,6 +37,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             bluetooth.BluetoothScanningMode.PASSIVE,
         )
     )
+
+    # Try the first refresh, but do not fail setup if the device is not
+    # immediately reachable. The coordinator will retry on its update
+    # interval. This is especially important for ESPHome Bluetooth proxies
+    # where the connection can take longer or get cancelled.
+    try:
+        await coordinator.async_config_entry_first_refresh()
+    except (UpdateFailed, TimeoutError, OSError):
+        coordinator.logger.info(
+            "Surplife BLE device %s not available during setup; will retry", address
+        )
+
     await hass.config_entries.async_forward_entry_setups(entry, [Platform.LIGHT])
     return True
 

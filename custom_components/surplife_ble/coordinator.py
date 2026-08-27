@@ -106,12 +106,18 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
             if self.client:
                 await self.client.disconnect()
             raise
-        except Exception as err:
+        except BaseException as err:
+            # Catch BaseException to include CancelledError from ESPHome proxy
+            # timeouts. Disconnect the client and wrap as UpdateFailed so the
+            # coordinator can retry on the next update interval.
             if self._was_available:
                 _LOGGER.warning("Surplife BLE device %s is unavailable: %s", self.address, err)
                 self._was_available = False
             if self.client:
-                await self.client.disconnect()
+                try:
+                    await self.client.disconnect()
+                except BaseException:
+                    pass
             raise UpdateFailed(str(err)) from err
 
     async def _async_command(self, method: str, *args: Any, **kwargs: Any) -> None:
