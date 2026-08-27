@@ -17,8 +17,8 @@ from typing import BinaryIO
 from .models import GattCharacteristic, GattProfile, GattService, TrafficRecord
 
 BTSNOOP_MAGIC = b"btsnoop\x00"
-# btsnoop timestamps are microseconds since 2000-01-01 UTC.
-BTSNOOP_EPOCH = datetime(2000, 1, 1, tzinfo=UTC)
+BTSNOOP_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+BTSNOOP_UNIX_EPOCH_DELTA_US = 0x00DC_DDB3_0F2F_8000
 
 # HCI H4 packet type prefixes.
 HCI_COMMAND = 0x01
@@ -32,9 +32,9 @@ L2CAP_CID_ATT = 0x0004
 # ATT opcodes relevant to the investigation.
 ATT_WRITE_REQUEST = 0x12
 ATT_WRITE_RESPONSE = 0x13
-ATT_WRITE_COMMAND = 0x1B
-ATT_HANDLE_VALUE_NOTIFICATION = 0x1D
-ATT_HANDLE_VALUE_INDICATION = 0x1E
+ATT_WRITE_COMMAND = 0x52
+ATT_HANDLE_VALUE_NOTIFICATION = 0x1B
+ATT_HANDLE_VALUE_INDICATION = 0x1D
 
 # ATT opcodes that carry an attribute handle in bytes 1-2.
 ATT_HANDLE_VALUE_OPCODES = frozenset(
@@ -54,7 +54,7 @@ class BtsnoopRecord:
     """One raw btsnoop packet record."""
 
     timestamp_us: int
-    direction: int  # 0 = received by host, 1 = sent by host
+    direction: int  # 0 = sent by host, 1 = received by host
     data: bytes
 
 
@@ -119,13 +119,14 @@ def parse_btsnoop(path: str | Path) -> Iterator[BtsnoopRecord]:
             flags = int.from_bytes(header[8:12], "big")
             timestamp_us = int.from_bytes(header[16:24], "big")
             data = _read_exact(stream, included_length)
-            # For HCI H4, bit 0 of flags: 0 = received by host, 1 = sent by host.
+            # For HCI H4, bit 0 of flags: 0 = sent by host, 1 = received by host.
             direction = flags & 0x01
             yield BtsnoopRecord(timestamp_us=timestamp_us, direction=direction, data=data)
 
 
 def _timestamp_from_us(microseconds: int) -> str:
-    return (BTSNOOP_EPOCH + timedelta(microseconds=microseconds)).isoformat()
+    unix_microseconds = microseconds - BTSNOOP_UNIX_EPOCH_DELTA_US
+    return (BTSNOOP_EPOCH + timedelta(microseconds=unix_microseconds)).isoformat()
 
 
 def _extract_acl_att(
@@ -156,11 +157,11 @@ def _extract_acl_att(
         return None
     attribute_handle = int.from_bytes(att[1:3], "little")
     value = bytes(att[3:])
-    # direction=1 (sent by host) = TX from the app to the lamp.
-    # direction=0 (received by host) = RX from the lamp to the app.
+    # direction=0 (sent by host) = TX from the app to the lamp.
+    # direction=1 (received by host) = RX from the lamp to the app.
     return AttRecord(
         timestamp=timestamp,
-        direction="tx" if direction == 1 else "rx",
+        direction="tx" if direction == 0 else "rx",
         opcode=opcode,
         attribute_handle=attribute_handle,
         value=value,
@@ -184,8 +185,14 @@ def summarize_connections(att_records: Iterable[AttRecord]) -> list[ConnectionSu
         by_handle.setdefault(record.connection_handle, []).append(record)
     summaries: list[ConnectionSummary] = []
     for handle, records in sorted(by_handle.items()):
-        writes = sum(1 for r in records if r.direction == "tx")
-        notifications = sum(1 for r in records if r.direction == "rx")
+        writes = sum(
+            1 for r in records if r.opcode in (ATT_WRITE_REQUEST, ATT_WRITE_COMMAND)
+        )
+        notifications = sum(
+            1
+            for r in records
+            if r.opcode in (ATT_HANDLE_VALUE_NOTIFICATION, ATT_HANDLE_VALUE_INDICATION)
+        )
         handles = frozenset(r.attribute_handle for r in records)
         summaries.append(
             ConnectionSummary(
@@ -220,18 +227,29 @@ def _opcode_note(opcode: int) -> str:
 
 
 def _characteristic_label(
-    attribute_handle: int,
+    att: AttRecord,
     handle_map: dict[int, GattCharacteristic],
 ) -> tuple[str, str | None]:
-    """Return (characteristic_uuid, note_suffix) for an ATT handle."""
-    characteristic = handle_map.get(attribute_handle)
+    """Return (characteristic_uuid, note_suffix) for an ATT record."""
+    is_cccd_write = att.opcode in (ATT_WRITE_REQUEST, ATT_WRITE_COMMAND) and att.value in (
+        b"\x00\x00",
+        b"\x01\x00",
+        b"\x02\x00",
+    )
+    if is_cccd_write:
+        for offset in (1, 2):
+            characteristic = handle_map.get(att.attribute_handle - offset)
+            if characteristic is not None and any(
+                prop in characteristic.properties for prop in ("notify", "indicate")
+            ):
+                return characteristic.uuid, "cccd write"
+    characteristic = handle_map.get(att.attribute_handle)
     if characteristic is not None:
         return characteristic.uuid, None
-    # Check if this is a CCCD (value handle + 1).
-    for handle, characteristic in handle_map.items():
-        if attribute_handle == handle + 1:
-            return characteristic.uuid, "cccd enable"
-    return f"handle:0x{attribute_handle:04x}", "unknown handle"
+    characteristic = handle_map.get(att.attribute_handle - 1)
+    if characteristic is not None:
+        return characteristic.uuid, "value handle offset +1"
+    return f"handle:0x{att.attribute_handle:04x}", "unknown handle"
 
 
 def att_to_traffic_records(
@@ -247,7 +265,7 @@ def att_to_traffic_records(
     for att in att_records:
         if connection_handle is not None and att.connection_handle != connection_handle:
             continue
-        characteristic_uuid, suffix = _characteristic_label(att.attribute_handle, resolved_map)
+        characteristic_uuid, suffix = _characteristic_label(att, resolved_map)
         note = _opcode_note(att.opcode)
         if suffix:
             note = f"{note} ({suffix})"

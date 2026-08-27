@@ -129,3 +129,19 @@ class LightState:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def apply_assumed_rgb(
+    state: LightState,
+    rgb: tuple[int, int, int] | None,
+    brightness: int | None,
+) -> LightState:
+    """Apply locally assumed RGB data to a polled device state."""
+    if rgb is None:
+        state.assumed = False
+        return state
+    state.rgb = rgb
+    state.brightness = brightness
+    state.white = 0
+    state.assumed = True
+    return state

@@ -9,7 +9,11 @@ from pathlib import Path
 import pytest
 
 from custom_components.surplife_ble.core.hci import (
+    ATT_HANDLE_VALUE_NOTIFICATION,
+    ATT_WRITE_COMMAND,
+    ATT_WRITE_REQUEST,
     BTSNOOP_EPOCH,
+    BTSNOOP_UNIX_EPOCH_DELTA_US,
     AttRecord,
     att_to_traffic_records,
     build_handle_to_uuid,
@@ -31,9 +35,6 @@ from custom_components.surplife_ble.core.models import (
 BTSNOOP_MAGIC = b"btsnoop\x00"
 HCI_ACL = 0x02
 L2CAP_CID_ATT = 0x0004
-ATT_WRITE_REQUEST = 0x12
-ATT_WRITE_COMMAND = 0x1B
-ATT_HANDLE_VALUE_NOTIFICATION = 0x1D
 
 
 def _btsnoop_header(datalink: int = 1002) -> bytes:
@@ -42,6 +43,8 @@ def _btsnoop_header(datalink: int = 1002) -> bytes:
 
 def _btsnoop_record(data: bytes, *, direction: int, timestamp_us: int) -> bytes:
     flags = direction & 0x01
+    if timestamp_us < BTSNOOP_UNIX_EPOCH_DELTA_US:
+        timestamp_us += BTSNOOP_UNIX_EPOCH_DELTA_US
     header = struct.pack(">IIII", len(data), len(data), flags, 0)
     return header + struct.pack(">Q", timestamp_us) + data
 
@@ -119,6 +122,12 @@ def _dx23012_profile() -> GattProfile:
 # ---------------------------------------------------------------------------
 
 
+def test_att_opcodes_match_bluetooth_specification() -> None:
+    assert ATT_WRITE_REQUEST == 0x12
+    assert ATT_WRITE_COMMAND == 0x52
+    assert ATT_HANDLE_VALUE_NOTIFICATION == 0x1B
+
+
 def test_parse_btsnoop_rejects_bad_magic(tmp_path: Path) -> None:
     path = tmp_path / "bad.log"
     path.write_bytes(b"notsnoop" + struct.pack(">II", 1, 1002))
@@ -136,13 +145,13 @@ def test_parse_btsnoop_rejects_unsupported_datalink(tmp_path: Path) -> None:
 def test_parse_btsnoop_yields_records_with_direction(tmp_path: Path) -> None:
     path = tmp_path / "test.log"
     _write_snoop(path, [
-        (_acl_packet(0x0040, _att_write_request(0x0016, b"\xea\x81\x8a\x8b")), 1, 1000),
-        (_acl_packet(0x0040, _att_notification(0x0013, b"\xea\x81\x01")), 0, 2000),
+        (_acl_packet(0x0040, _att_write_request(0x0016, b"\xea\x81\x8a\x8b")), 0, 1000),
+        (_acl_packet(0x0040, _att_notification(0x0013, b"\xea\x81\x01")), 1, 2000),
     ])
     records = list(parse_btsnoop(path))
     assert len(records) == 2
-    assert records[0].direction == 1  # sent by host
-    assert records[1].direction == 0  # received by host
+    assert records[0].direction == 0  # sent by host
+    assert records[1].direction == 1  # received by host
     assert records[0].data[0] == HCI_ACL
 
 
@@ -154,9 +163,9 @@ def test_parse_btsnoop_yields_records_with_direction(tmp_path: Path) -> None:
 def test_extract_att_records_filters_to_writes_and_notifications(tmp_path: Path) -> None:
     path = tmp_path / "test.log"
     _write_snoop(path, [
-        (_acl_packet(0x0040, _att_write_request(0x0016, b"\xea\x81\x8a\x8b")), 1, 1000),
-        (_acl_packet(0x0040, _att_write_command(0x0016, b"\x71\x23\x0f")), 1, 2000),
-        (_acl_packet(0x0040, _att_notification(0x0013, b"\xea\x81\x01\x00")), 0, 3000),
+        (_acl_packet(0x0040, _att_write_request(0x0016, b"\xea\x81\x8a\x8b")), 0, 1000),
+        (_acl_packet(0x0040, _att_write_command(0x0016, b"\x71\x23\x0f")), 0, 2000),
+        (_acl_packet(0x0040, _att_notification(0x0013, b"\xea\x81\x01\x00")), 1, 3000),
     ])
     att_records = list(extract_att_records(parse_btsnoop(path)))
     assert len(att_records) == 3
@@ -183,7 +192,11 @@ def test_extract_att_records_ignores_non_att_cid(tmp_path: Path) -> None:
 def test_extract_att_timestamps_are_iso(tmp_path: Path) -> None:
     path = tmp_path / "test.log"
     _write_snoop(path, [
-        (_acl_packet(0x0040, _att_write_request(0x0016, b"\x01")), 1, 0),
+        (
+            _acl_packet(0x0040, _att_write_request(0x0016, b"\x01")),
+            0,
+            BTSNOOP_UNIX_EPOCH_DELTA_US,
+        ),
     ])
     att_records = list(extract_att_records(parse_btsnoop(path)))
     assert att_records[0].timestamp == BTSNOOP_EPOCH.isoformat()
@@ -197,9 +210,9 @@ def test_extract_att_timestamps_are_iso(tmp_path: Path) -> None:
 def test_summarize_connections_groups_by_handle(tmp_path: Path) -> None:
     path = tmp_path / "test.log"
     _write_snoop(path, [
-        (_acl_packet(0x0040, _att_write_request(0x0016, b"\x01")), 1, 1000),
-        (_acl_packet(0x0040, _att_notification(0x0013, b"\x02")), 0, 2000),
-        (_acl_packet(0x0041, _att_write_request(0x0016, b"\x03")), 1, 3000),
+        (_acl_packet(0x0040, _att_write_request(0x0016, b"\x01")), 0, 1000),
+        (_acl_packet(0x0040, _att_notification(0x0013, b"\x02")), 1, 2000),
+        (_acl_packet(0x0041, _att_write_request(0x0016, b"\x03")), 0, 3000),
     ])
     att_records = list(extract_att_records(parse_btsnoop(path)))
     summaries = summarize_connections(att_records)
@@ -269,7 +282,34 @@ def test_att_to_traffic_records_labels_cccd_writes() -> None:
     ]
     traffic = att_to_traffic_records(att_records, device_id="DEV", handle_map=handle_map)
     assert traffic[0].characteristic == "0000ff02-0000-1000-8000-00805f9b34fb"
-    assert "cccd enable" in (traffic[0].note or "")
+    assert "cccd write" in (traffic[0].note or "")
+
+
+def test_att_to_traffic_records_maps_android_value_handle_offset() -> None:
+    handle_map = build_handle_to_uuid(_dx23012_profile())
+    att_records = [
+        AttRecord(
+            "2026-01-01T00:00:00+00:00",
+            "tx",
+            ATT_WRITE_COMMAND,
+            23,
+            b"\x00\x01\x80\x00",
+            0x0040,
+        ),
+        AttRecord(
+            "2026-01-01T00:00:01+00:00",
+            "rx",
+            ATT_HANDLE_VALUE_NOTIFICATION,
+            20,
+            b"\xea\x81\x01",
+            0x0040,
+        ),
+    ]
+
+    traffic = att_to_traffic_records(att_records, device_id="DEV", handle_map=handle_map)
+
+    assert traffic[0].characteristic == "0000ff01-0000-1000-8000-00805f9b34fb"
+    assert traffic[1].characteristic == "0000ff02-0000-1000-8000-00805f9b34fb"
 
 
 # ---------------------------------------------------------------------------
@@ -312,9 +352,9 @@ def test_end_to_end_snoop_to_traffic_records(tmp_path: Path) -> None:
     snoop_path = tmp_path / "btsnoop_hci.log"
     _write_snoop(snoop_path, [
         # App writes the classic query to FF01 (handle 0x16=22).
-        (_acl_packet(0x0040, _att_write_request(22, b"\x81\x8a\x8b\x96")), 1, 1000),
+        (_acl_packet(0x0040, _att_write_request(22, b"\x81\x8a\x8b\x96")), 0, 1000),
         # Lamp responds with EA 81 state on FF02 (handle 0x13=19).
-        (_acl_packet(0x0040, _att_notification(19, b"\xea\x81\x01\x00\xaa\x09\x23")), 0, 2000),
+        (_acl_packet(0x0040, _att_notification(19, b"\xea\x81\x01\x00\xaa\x09\x23")), 1, 2000),
     ])
     profile = _dx23012_profile()
     handle_map = build_handle_to_uuid(profile)
