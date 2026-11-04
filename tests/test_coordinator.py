@@ -186,7 +186,7 @@ async def test_command_does_not_retry_programming_errors(
 
     client = FakeClient()
 
-    async def get_client() -> FakeClient:
+    async def get_client(**_kwargs: object) -> FakeClient:
         return client
 
     coordinator._async_get_client = get_client
@@ -227,7 +227,7 @@ def _polling_coordinator(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any, Pol
     coordinator.client = client
     coordinator.data = None
 
-    async def get_client() -> PollingFakeClient:
+    async def get_client(**_kwargs: object) -> PollingFakeClient:
         return client
 
     coordinator._async_get_client = get_client
@@ -311,3 +311,110 @@ async def test_probe_gets_a_longer_budget_than_a_resolved_query(
     client.resolved = True
     with pytest.raises(module.UpdateFailed):
         await coordinator._async_update_data()
+
+
+class UnreachableFakeClient:
+    """A client whose connection attempt never completes, like a lamp out of range."""
+
+    def __init__(self) -> None:
+        self.connected = False
+        self.resolved = True
+        self.resolution = SimpleNamespace(repeatable=True)
+        self.state = LightState(power=True)
+        self.connects = 0
+        # Number of connection attempts that hang before one succeeds.
+        self.hang_attempts = 10**6
+
+    def set_ble_device(self, *_args: object) -> None:
+        return None
+
+    async def connect(self) -> None:
+        self.connects += 1
+        if self.connects <= self.hang_attempts:
+            await asyncio.sleep(3600)
+        self.connected = True
+
+    async def set_power(self, turn_on: bool) -> None:
+        self.state.power = turn_on
+
+    async def disconnect(self) -> None:
+        self.connected = False
+
+    async def clear_cache(self) -> None:
+        return None
+
+
+def _unreachable_coordinator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Any, Any, UnreachableFakeClient]:
+    module = _load_coordinator(monkeypatch)
+    monkeypatch.setattr(module, "_CONNECT_ATTEMPT_TIMEOUT_SECONDS", 0.01)
+    coordinator = module.SurplifeCoordinator(FakeHass(), FakeEntry())
+    coordinator._ble_device = object()
+    client = UnreachableFakeClient()
+    coordinator.client = client
+    return module, coordinator, client
+
+
+@pytest.mark.asyncio
+async def test_command_bounds_each_connection_attempt_and_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, coordinator, client = _unreachable_coordinator(monkeypatch)
+    with pytest.raises(module.ConnectionFailed, match="2 attempt.*timed out"):
+        await coordinator._async_command("set_power", True)
+    # Every attempt hung and was cut off; the command did not start a third.
+    assert client.connects == module._COMMAND_CONNECT_ATTEMPTS == 2
+
+
+@pytest.mark.asyncio
+async def test_command_succeeds_when_a_retried_connection_works(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _module, coordinator, client = _unreachable_coordinator(monkeypatch)
+    client.hang_attempts = 1
+    state = await coordinator._async_command("set_power", False)
+    assert state.power is False
+    assert client.connects == 2
+    assert coordinator._connect_failed_at is None
+
+
+@pytest.mark.asyncio
+async def test_queued_commands_fail_fast_after_a_failed_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, coordinator, client = _unreachable_coordinator(monkeypatch)
+    with pytest.raises(module.ConnectionFailed):
+        await coordinator._async_command("set_power", True)
+    with pytest.raises(module.ConnectionFailed, match="not reachable"):
+        await coordinator._async_command("set_power", False)
+    assert client.connects == 2
+
+    # Once the cooldown has passed, a command makes its own attempts again.
+    coordinator._connect_failed_at -= module._CONNECT_COOLDOWN_SECONDS
+    client.hang_attempts = 0
+    state = await coordinator._async_command("set_power", False)
+    assert state.power is False
+    assert client.connects == 3
+    assert coordinator._connect_failed_at is None
+
+
+@pytest.mark.asyncio
+async def test_poll_reconnects_during_command_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, coordinator, client = _unreachable_coordinator(monkeypatch)
+    with pytest.raises(module.ConnectionFailed):
+        await coordinator._async_command("set_power", True)
+
+    client.hang_attempts = 0
+
+    async def query_state(**_kwargs: object) -> LightState:
+        return client.state
+
+    client.query_state = query_state
+    coordinator.data = None
+    assert (await coordinator._async_update_data()).power
+    assert coordinator._connect_failed_at is None
+    await coordinator._async_command("set_power", False)
+    assert client.connects == 3
