@@ -265,6 +265,7 @@ async def _probe(args: argparse.Namespace) -> int:
         resolution = await client.probe(
             allow_writes=args.allow_probe_write,
             response_timeout=args.response_timeout,
+            exhaustive=True,
         )
         result = {
             "resolution": resolution.to_dict() if resolution else None,

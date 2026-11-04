@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from bleak.backends.device import BLEDevice
@@ -25,6 +25,20 @@ from .core.models import LightState, apply_assumed_rgb, rgb_state_matches
 _LOGGER = logging.getLogger(__name__)
 _ASSUMED_RGB_SECONDS = 5.0
 _CONFIRMATION_DELAY_SECONDS = 0.3
+# Upper bound for the GATT work of one poll or command once connected. The
+# connection itself is bounded by bleak_retry_connector, which needs longer on
+# Bluetooth proxies, so it is not included.
+_OPERATION_TIMEOUT_SECONDS = 15.0
+_DISCONNECT_TIMEOUT_SECONDS = 10.0
+# A link can stay "connected" while the lamp stops answering. Drop it after this
+# many failed polls in a row, so the next poll makes a fresh connection.
+_RECONNECT_AFTER_FAILURES = 2
+# Keep showing the last known state (marked assumed) for this many failed polls
+# in a row before the entity becomes unavailable.
+_TOLERATED_FAILURES = 3
+# Wait between attempts to identify an unresolved device, doubling up to the cap.
+_PROBE_BACKOFF_BASE_SECONDS = 15.0
+_PROBE_BACKOFF_MAX_SECONDS = 300.0
 
 
 @dataclass(slots=True)
@@ -57,6 +71,9 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
         self._assumed_rgb_brightness: int | None = None
         self._assumed_rgb_deadline: float | None = None
         self._confirmation_generation = 0
+        self._consecutive_failures = 0
+        self._probe_failures = 0
+        self._next_probe_at: float | None = None
 
     def async_set_ble_device(
         self, device: BLEDevice, advertisement: AdvertisementData | None
@@ -151,58 +168,117 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
                 self._refresh_after_assumed_deadline(self._assumed_rgb_deadline)
             )
 
+    async def _async_reset_connection(self, *, clear_cache: bool = False) -> None:
+        """Drop the BLE connection so the next operation reconnects from scratch."""
+        if self.client is None:
+            return
+        if clear_cache:
+            await self.client.clear_cache()
+        with suppress(Exception):
+            async with asyncio.timeout(_DISCONNECT_TIMEOUT_SECONDS):
+                await self.client.disconnect()
+
+    def _probe_backoff_active(self) -> bool:
+        return (
+            self._next_probe_at is not None
+            and asyncio.get_running_loop().time() < self._next_probe_at
+        )
+
+    def _record_probe_failure(self) -> None:
+        self._probe_failures += 1
+        delay = min(
+            _PROBE_BACKOFF_BASE_SECONDS * 2 ** (self._probe_failures - 1),
+            _PROBE_BACKOFF_MAX_SECONDS,
+        )
+        self._next_probe_at = asyncio.get_running_loop().time() + delay
+
+    def _record_success(self) -> None:
+        self._consecutive_failures = 0
+        self._probe_failures = 0
+        self._next_probe_at = None
+        if not self._was_available:
+            _LOGGER.info("Surplife BLE device %s is now available", self.address)
+            self._was_available = True
+
+    async def _async_poll(self) -> LightState:
+        client = await self._async_get_client()
+        was_resolved = client.resolved
+        async with asyncio.timeout(_OPERATION_TIMEOUT_SECONDS):
+            # Once resolved, the lamp answers on FF02 notifications; polling every
+            # readable characteristic after a slow reply only adds GATT traffic.
+            state = await client.query_state(allow_reads=not was_resolved)
+        if state is None:
+            raise UpdateFailed("device did not return a supported state frame")
+        if not client.resolution or not client.resolution.repeatable:
+            raise UpdateFailed("device state response could not be repeated")
+        return state
+
     async def _async_update_data(self) -> LightState:
-        try:
-            async with self._operation_lock:
-                client = await self._async_get_client()
-                state = await client.query_state()
-                if state is None:
-                    raise UpdateFailed("device did not return a supported state frame")
-                if not client.resolution or not client.resolution.repeatable:
-                    raise UpdateFailed("device state response could not be repeated")
-                state = self._reconcile_assumed_rgb(state)
-                if not self._was_available:
-                    _LOGGER.info("Surplife BLE device %s is now available", self.address)
-                    self._was_available = True
-                return state
-        except UpdateFailed:
-            if self._was_available:
-                _LOGGER.warning("Surplife BLE device %s is unavailable", self.address)
-                self._was_available = False
-            # Do not disconnect on transient errors. The bleak_retry_connector
-            # will reconnect on the next attempt. Disconnecting here forces a
-            # full reconnect (discover, subscribe, probe) on every poll failure,
-            # which makes commands slow.
-            raise
-        except Exception as err:
-            if self._was_available:
-                _LOGGER.warning("Surplife BLE device %s is unavailable: %s", self.address, err)
-                self._was_available = False
-            # Do not disconnect on transient errors. Let the next poll or
-            # command retry with the existing connection state.
-            raise UpdateFailed(str(err)) from err
+        async with self._operation_lock:
+            client = self.client
+            if client is not None and not client.resolved and self._probe_backoff_active():
+                # Probing writes a burst of guessed frames. Repeating it on every
+                # poll keeps the lamp busy and can make it disconnect.
+                raise UpdateFailed("waiting before identifying the device again")
+            try:
+                state = await self._async_poll()
+            except Exception as err:
+                return await self._async_handle_poll_failure(err)
+            self._record_success()
+            return self._reconcile_assumed_rgb(state)
+
+    async def _async_handle_poll_failure(self, err: Exception) -> LightState:
+        self._consecutive_failures += 1
+        if self.client is not None and not self.client.resolved:
+            self._record_probe_failure()
+        if isinstance(err, BleakError):
+            # Stale cached services make every write fail the same way, so drop
+            # them along with the link.
+            await self._async_reset_connection(clear_cache=True)
+        elif self._consecutive_failures >= _RECONNECT_AFTER_FAILURES:
+            _LOGGER.debug(
+                "Surplife BLE device %s failed %s polls in a row; reconnecting",
+                self.address,
+                self._consecutive_failures,
+            )
+            await self._async_reset_connection()
+
+        if self.data is not None and self._consecutive_failures < _TOLERATED_FAILURES:
+            _LOGGER.debug(
+                "Surplife BLE poll of %s failed (%s/%s), keeping last state: %s",
+                self.address,
+                self._consecutive_failures,
+                _TOLERATED_FAILURES,
+                err,
+            )
+            return replace(self.data, assumed=True)
+
+        if self._was_available:
+            _LOGGER.warning("Surplife BLE device %s is unavailable: %s", self.address, err)
+            self._was_available = False
+        if isinstance(err, UpdateFailed):
+            raise err
+        raise UpdateFailed(str(err) or type(err).__name__) from err
+
+    async def _async_run_command(self, method: str, *args: Any, **kwargs: Any) -> None:
+        client = await self._async_get_client()
+        async with asyncio.timeout(_OPERATION_TIMEOUT_SECONDS):
+            if not client.resolution or not client.resolution.repeatable:
+                await client.query_state()
+            await getattr(client, method)(*args, **kwargs)
 
     async def _async_command(self, method: str, *args: Any, **kwargs: Any) -> LightState:
         async with self._operation_lock:
             try:
-                client = await self._async_get_client()
-                if not client.resolution or not client.resolution.repeatable:
-                    await client.query_state()
-                command = getattr(client, method)
-                await command(*args, **kwargs)
+                await self._async_run_command(method, *args, **kwargs)
             except (BleakError, TimeoutError, OSError) as err:
-                _LOGGER.debug("Command %s failed, retrying: %s", method, err)
-                if self.client:
-                    with suppress(Exception):
-                        await self.client.disconnect()
-                client = await self._async_get_client()
-                if not client.resolution or not client.resolution.repeatable:
-                    await client.query_state()
-                command = getattr(client, method)
-                await command(*args, **kwargs)
-            assert client.state is not None
-            self.async_set_updated_data(client.state)
-            return client.state
+                _LOGGER.debug("Command %s failed, reconnecting and retrying: %s", method, err)
+                await self._async_reset_connection(clear_cache=isinstance(err, BleakError))
+                await self._async_run_command(method, *args, **kwargs)
+            assert self.client is not None and self.client.state is not None
+            self._record_success()
+            self.async_set_updated_data(self.client.state)
+            return self.client.state
 
     async def async_set_power(self, turn_on: bool) -> None:
         await self._async_command("set_power", turn_on)
@@ -252,5 +328,4 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
             self._clear_assumed_rgb()
 
     async def async_disconnect(self) -> None:
-        if self.client:
-            await self.client.disconnect()
+        await self._async_reset_connection()

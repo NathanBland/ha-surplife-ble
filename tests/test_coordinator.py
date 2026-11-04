@@ -192,3 +192,100 @@ async def test_command_does_not_retry_programming_errors(
     with pytest.raises(ValueError, match="invalid command"):
         await coordinator._async_command("set_rgb")
     assert calls == 1
+
+
+class PollingFakeClient:
+    """A resolved client whose state queries can be made to fail."""
+
+    def __init__(self) -> None:
+        self.resolved = True
+        self.resolution = SimpleNamespace(repeatable=True)
+        self.state = LightState(power=True, brightness=100)
+        self.error: Exception | None = None
+        self.queries = 0
+        self.disconnects = 0
+        self.cache_clears = 0
+
+    async def query_state(self, **_kwargs: object) -> LightState | None:
+        self.queries += 1
+        if self.error is not None:
+            raise self.error
+        return self.state
+
+    async def disconnect(self) -> None:
+        self.disconnects += 1
+
+    async def clear_cache(self) -> None:
+        self.cache_clears += 1
+
+
+def _polling_coordinator(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any, PollingFakeClient]:
+    module = _load_coordinator(monkeypatch)
+    coordinator = module.SurplifeCoordinator(FakeHass(), FakeEntry())
+    client = PollingFakeClient()
+    coordinator.client = client
+    coordinator.data = None
+
+    async def get_client() -> PollingFakeClient:
+        return client
+
+    coordinator._async_get_client = get_client
+    return module, coordinator, client
+
+
+@pytest.mark.asyncio
+async def test_silent_link_is_reconnected_and_last_state_is_kept(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, coordinator, client = _polling_coordinator(monkeypatch)
+    coordinator.data = await coordinator._async_update_data()
+
+    client.error = module.UpdateFailed("device did not return a supported state frame")
+    first = await coordinator._async_update_data()
+    assert first.assumed and first.power
+    assert client.disconnects == 0
+
+    second = await coordinator._async_update_data()
+    assert second.assumed
+    assert client.disconnects == 1
+
+    with pytest.raises(module.UpdateFailed):
+        await coordinator._async_update_data()
+
+    client.error = None
+    recovered = await coordinator._async_update_data()
+    assert not recovered.assumed
+    assert coordinator._consecutive_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_bleak_error_clears_cache_and_reconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, coordinator, client = _polling_coordinator(monkeypatch)
+    client.error = module.BleakError("write failed")
+    with pytest.raises(module.UpdateFailed):
+        await coordinator._async_update_data()
+    assert client.cache_clears == 1
+    assert client.disconnects == 1
+
+
+@pytest.mark.asyncio
+async def test_unresolved_device_is_not_probed_on_every_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, coordinator, client = _polling_coordinator(monkeypatch)
+    client.resolved = False
+    client.error = module.UpdateFailed("no supported state frame")
+    with pytest.raises(module.UpdateFailed):
+        await coordinator._async_update_data()
+    with pytest.raises(module.UpdateFailed, match="waiting"):
+        await coordinator._async_update_data()
+    assert client.queries == 1
+
+    coordinator._next_probe_at = asyncio.get_running_loop().time() - 1
+    with pytest.raises(module.UpdateFailed):
+        await coordinator._async_update_data()
+    assert client.queries == 2
+    # The wait doubles after each failed attempt.
+    assert coordinator._next_probe_at - asyncio.get_running_loop().time() > 20

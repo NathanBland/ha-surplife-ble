@@ -85,6 +85,10 @@ class LightClient:
         self._notifications: asyncio.Queue[tuple[str, bytes]] = asyncio.Queue()
         self._reassemblers: dict[str, NotificationReassembler] = {}
         self._notifying: set[str] = set()
+        # Characteristics whose subscription failed on this connection. They are
+        # not retried until the next connection, so a broken one does not add a
+        # slow GATT round trip before every write.
+        self._notify_failed: set[str] = set()
         self._sequence = SequenceCounter()
         self._write_characteristic: GattCharacteristic | None = None
         self._probe_frame: ProbeFrame | None = None
@@ -94,6 +98,21 @@ class LightClient:
     @property
     def connected(self) -> bool:
         return bool(self._client and self._client.is_connected)
+
+    @property
+    def resolved(self) -> bool:
+        """True once a state query path has been found (it survives reconnects)."""
+        return self._probe_frame is not None
+
+    async def clear_cache(self) -> None:
+        """Drop the cached GATT services, when the client supports a cache."""
+        clear = getattr(self._client, "clear_cache", None)
+        if clear is None:
+            return
+        with suppress(Exception):
+            result = clear()
+            if inspect.isawaitable(result):
+                await result
 
     def set_ble_device(
         self,
@@ -120,6 +139,7 @@ class LightClient:
         if client is not None and client is not self._client:
             return
         self._notifying.clear()
+        self._notify_failed.clear()
         self._flush_notifications()
 
     async def disconnect(self) -> None:
@@ -186,12 +206,14 @@ class LightClient:
     async def _start_notifications(self) -> None:
         client = self._require_client()
         assert self._profile is not None
-        ordered = sorted(
-            self._profile.notifiable,
-            key=lambda item: (not _uuid_is(item.uuid, "ff02"), item.uuid),
-        )
+        # The lamps answer on FF02. Subscribing to every notifiable characteristic
+        # (Service Changed, vendor or OTA characteristics) adds GATT traffic and
+        # can upset the firmware, so only fall back to all of them when FF02 is absent.
+        notifiable = self._profile.notifiable
+        preferred = [item for item in notifiable if _uuid_is(item.uuid, "ff02")]
+        ordered = preferred or sorted(notifiable, key=lambda item: item.uuid)
         for characteristic in ordered:
-            if characteristic.uuid in self._notifying:
+            if characteristic.uuid in self._notifying or characteristic.uuid in self._notify_failed:
                 continue
 
             def callback(sender: Any, data: bytearray, *, uuid: str = characteristic.uuid) -> None:
@@ -224,6 +246,7 @@ class LightClient:
                         note=f"start_notify failed: {err}",
                     )
                 )
+                self._notify_failed.add(characteristic.uuid)
                 continue
             self._notifying.add(characteristic.uuid)
 
@@ -341,8 +364,16 @@ class LightClient:
         *,
         allow_writes: bool,
         response_timeout: float = 1.25,
+        exhaustive: bool = False,
     ) -> ProtocolResolution | None:
-        """Send known state queries and require a repeatable response for control."""
+        """Send known state queries and require a repeatable response for control.
+
+        By default the queries go only to the FF01 write characteristic when the
+        device has one, and readable characteristics are not polled after each
+        unanswered query. Writing guessed frames to other characteristics can make
+        these lamps drop the connection. ``exhaustive=True`` tries every writable
+        characteristic with the read fallback, for investigating unknown devices.
+        """
         if not allow_writes:
             raise PermissionError("probing requires allow_writes=True")
         if not self.connected:
@@ -354,6 +385,11 @@ class LightClient:
             self._profile.writable,
             key=lambda item: (not _uuid_is(item.uuid, "ff01"), item.uuid),
         )
+        preferred = [item for item in write_targets if _uuid_is(item.uuid, "ff01")]
+        narrow = not exhaustive and bool(preferred)
+        if narrow:
+            write_targets = preferred
+        allow_reads = not narrow
         for write_target in write_targets:
             for candidate in probe_frames():
                 self._flush_notifications()
@@ -376,7 +412,9 @@ class LightClient:
                         )
                     )
                     continue
-                first = await self._await_classification(response_timeout)
+                first = await self._await_classification(
+                    response_timeout, allow_reads=allow_reads
+                )
                 if first is None:
                     continue
                 resolution, state = first
@@ -391,7 +429,9 @@ class LightClient:
                     note=f"{candidate.name}:confirmation",
                     characteristic=write_target,
                 )
-                confirmation = await self._await_classification(response_timeout)
+                confirmation = await self._await_classification(
+                    response_timeout, allow_reads=allow_reads
+                )
                 if confirmation:
                     confirmed_resolution, confirmed_state = confirmation
                     same_identity = (

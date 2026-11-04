@@ -360,3 +360,80 @@ def test_polled_state_is_not_assumed_without_local_rgb() -> None:
 
     assert result.white == 255
     assert result.assumed is False
+
+
+class CrowdedFakeBleakClient(FakeBleakClient):
+    """FF01/FF02 plus unrelated vendor characteristics, like an OTA service."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.vendor_write = FakeCharacteristic(
+            "0000fe01-0000-1000-8000-00805f9b34fb", 0x30, ["write"]
+        )
+        self.vendor_notify = FakeCharacteristic(
+            "0000fe02-0000-1000-8000-00805f9b34fb", 0x32, ["notify"]
+        )
+        self.services.append(
+            FakeService(
+                "0000fe00-0000-1000-8000-00805f9b34fb",
+                0x2F,
+                [self.vendor_write, self.vendor_notify],
+            )
+        )
+        self.start_notify_calls: list[str] = []
+        self.reads: list[str] = []
+        self.fail_notify = False
+
+    async def start_notify(self, uuid: str, callback: Any) -> None:
+        self.start_notify_calls.append(uuid)
+        if self.fail_notify:
+            raise RuntimeError("subscription failed")
+        await super().start_notify(uuid, callback)
+
+    async def write_gatt_char(self, uuid: str, data: bytes, response: bool | None = None) -> None:
+        self.writes.append((uuid, bytes(data), response))
+
+    async def read_gatt_char(self, uuid: str) -> bytearray:
+        self.reads.append(uuid)
+        return bytearray()
+
+
+@pytest.mark.asyncio
+async def test_probe_only_writes_to_ff01_and_skips_reads() -> None:
+    fake = CrowdedFakeBleakClient()
+    client = LightClient(FakeDevice(), client_factory=lambda _device: fake)  # type: ignore[arg-type]
+    async with client:
+        assert await client.probe(allow_writes=True, response_timeout=0.001) is None
+    assert fake.writes
+    assert {uuid for uuid, _data, _response in fake.writes} == {fake.write.uuid}
+    assert fake.reads == []
+    assert fake.start_notify_calls == [fake.notify.uuid]
+
+
+@pytest.mark.asyncio
+async def test_exhaustive_probe_tries_every_writable_characteristic() -> None:
+    fake = CrowdedFakeBleakClient()
+    client = LightClient(FakeDevice(), client_factory=lambda _device: fake)  # type: ignore[arg-type]
+    async with client:
+        await client.probe(allow_writes=True, response_timeout=0.001, exhaustive=True)
+    assert {uuid for uuid, _data, _response in fake.writes} == {
+        fake.write.uuid,
+        fake.vendor_write.uuid,
+    }
+    assert fake.reads
+
+
+@pytest.mark.asyncio
+async def test_failed_subscription_is_not_retried_until_reconnect() -> None:
+    fake = CrowdedFakeBleakClient()
+    fake.fail_notify = True
+    client = LightClient(FakeDevice(), client_factory=lambda _device: fake)  # type: ignore[arg-type]
+    await client.connect()
+    await client._start_notifications()
+    await client._start_notifications()
+    assert fake.start_notify_calls == [fake.notify.uuid]
+
+    await client.disconnect()
+    await client.connect()
+    await client._start_notifications()
+    assert fake.start_notify_calls == [fake.notify.uuid, fake.notify.uuid]
