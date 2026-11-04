@@ -29,6 +29,10 @@ _CONFIRMATION_DELAY_SECONDS = 0.3
 # connection itself is bounded by bleak_retry_connector, which needs longer on
 # Bluetooth proxies, so it is not included.
 _OPERATION_TIMEOUT_SECONDS = 15.0
+# Identifying an unresolved device writes up to 12 probe frames to FF01 and
+# waits 1.25 s after each (twice when a reply needs confirming), so it needs
+# a larger budget than a resolved query.
+_PROBE_TIMEOUT_SECONDS = 60.0
 _DISCONNECT_TIMEOUT_SECONDS = 10.0
 # A link can stay "connected" while the lamp stops answering. Drop it after this
 # many failed polls in a row, so the next poll makes a fresh connection.
@@ -200,10 +204,14 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
             _LOGGER.info("Surplife BLE device %s is now available", self.address)
             self._was_available = True
 
+    @staticmethod
+    def _operation_timeout(client: LightClient) -> float:
+        return _OPERATION_TIMEOUT_SECONDS if client.resolved else _PROBE_TIMEOUT_SECONDS
+
     async def _async_poll(self) -> LightState:
         client = await self._async_get_client()
         was_resolved = client.resolved
-        async with asyncio.timeout(_OPERATION_TIMEOUT_SECONDS):
+        async with asyncio.timeout(self._operation_timeout(client)):
             # Once resolved, the lamp answers on FF02 notifications; polling every
             # readable characteristic after a slow reply only adds GATT traffic.
             state = await client.query_state(allow_reads=not was_resolved)
@@ -262,7 +270,7 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
 
     async def _async_run_command(self, method: str, *args: Any, **kwargs: Any) -> None:
         client = await self._async_get_client()
-        async with asyncio.timeout(_OPERATION_TIMEOUT_SECONDS):
+        async with asyncio.timeout(self._operation_timeout(client)):
             if not client.resolution or not client.resolution.repeatable:
                 await client.query_state()
             await getattr(client, method)(*args, **kwargs)

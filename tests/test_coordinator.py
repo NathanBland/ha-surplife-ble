@@ -175,6 +175,7 @@ async def test_command_does_not_retry_programming_errors(
     calls = 0
 
     class FakeClient:
+        resolved = True
         resolution = SimpleNamespace(repeatable=True)
         state = LightState()
 
@@ -289,3 +290,24 @@ async def test_unresolved_device_is_not_probed_on_every_poll(
     assert client.queries == 2
     # The wait doubles after each failed attempt.
     assert coordinator._next_probe_at - asyncio.get_running_loop().time() > 20
+
+
+@pytest.mark.asyncio
+async def test_probe_gets_a_longer_budget_than_a_resolved_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, coordinator, client = _polling_coordinator(monkeypatch)
+    monkeypatch.setattr(module, "_OPERATION_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(module, "_PROBE_TIMEOUT_SECONDS", 1.0)
+
+    async def slow_query(**_kwargs: object) -> LightState:
+        await asyncio.sleep(0.05)
+        return client.state
+
+    client.query_state = slow_query
+    client.resolved = False
+    assert (await coordinator._async_update_data()).power
+
+    client.resolved = True
+    with pytest.raises(module.UpdateFailed):
+        await coordinator._async_update_data()
