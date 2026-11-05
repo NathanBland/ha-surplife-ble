@@ -400,6 +400,21 @@ async def test_queued_commands_fail_fast_after_a_failed_connection(
 
 
 @pytest.mark.asyncio
+async def test_unreachable_unresolved_device_retries_on_every_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, coordinator, client = _unreachable_coordinator(monkeypatch)
+    client.resolved = False
+    coordinator.data = None
+    for _ in range(3):
+        with pytest.raises(module.ConnectionFailed):
+            await coordinator._async_update_data()
+    # Failed connections never sent probe frames, so they must not back off.
+    assert coordinator._next_probe_at is None
+    assert client.connects == 3
+
+
+@pytest.mark.asyncio
 async def test_poll_reconnects_during_command_cooldown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

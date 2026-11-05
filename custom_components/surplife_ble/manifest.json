@@ -1,7 +1,7 @@
 {
   "domain": "surplife_ble",
   "name": "Surplife BLE",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "codeowners": ["@NathanBland"],
   "config_flow": true,
   "dependencies": ["bluetooth_adapters"],

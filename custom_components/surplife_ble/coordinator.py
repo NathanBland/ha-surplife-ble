@@ -293,7 +293,13 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
 
     async def _async_handle_poll_failure(self, err: Exception) -> LightState:
         self._consecutive_failures += 1
-        if self.client is not None and not self.client.resolved:
+        if (
+            self.client is not None
+            and not self.client.resolved
+            and not isinstance(err, ConnectionFailed)
+        ):
+            # Only a probe that ran and failed backs off. A lamp that could not
+            # be reached was never sent probe frames, so retry it on the next poll.
             self._record_probe_failure()
         if isinstance(err, BleakError):
             # Stale cached services make every write fail the same way, so drop
