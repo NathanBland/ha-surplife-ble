@@ -156,11 +156,14 @@ def test_lamp_state_carries_product_and_segments_capability() -> None:
 class FakeLamp(FakeIotbtBleakClient):
     """IOTBT lamp that answers the profile query and applies power commands."""
 
-    def __init__(self, *, mtu: int | None = None, accepts_app_power: bool = True) -> None:
+    def __init__(
+        self, *, mtu: int | None = None, accepts_app_power: bool = True, drop_power: int = 0
+    ) -> None:
         super().__init__()
         if mtu is not None:
             self.mtu_size = mtu
         self.accepts_app_power = accepts_app_power
+        self.drop_power = drop_power
         self._reassembler = NotificationReassembler()
 
     async def write_gatt_char(self, uuid: str, data: bytes, response: bool | None = None) -> None:
@@ -170,6 +173,9 @@ class FakeLamp(FakeIotbtBleakClient):
             self.callbacks[self.notify.uuid](self.notify, bytearray(PROFILE_RESPONSE))
             return
         body = data[8:] if len(data) > 8 and data[2:4] == b"\x80\x00" else b""
+        if body[:2] == b"\xe0\x01" and self.drop_power > 0:
+            self.drop_power -= 1
+            return
         if body[:2] == b"\xe0\x01" and len(body) == 15 and self.accepts_app_power:
             self._set_power(body[4])
         elif body[:2] == b"\xe0\x01" and len(body) == 14:
@@ -208,10 +214,43 @@ async def test_power_falls_back_to_zone_form_when_ignored() -> None:
         await client.set_power(False)
         assert client._power_form == POWER_FORM_ZONE
         assert client.state is not None and client.state.power is False
-        before = len(fake.writes)
+        before = len(_power_writes(fake))
         await client.set_power(True)
-        # A cached form costs a single write.
-        assert len(fake.writes) == before + 1
+        # A cached form costs a single power write, still verified.
+        assert len(_power_writes(fake)) == before + 1
+        assert client.state is not None and client.state.power is True
+        assert client.state.assumed is False
+
+
+def _power_writes(fake: FakeLamp) -> list[bytes]:
+    return [bytes(d) for _u, d, _r in fake.writes if bytes(d)[8:10] == b"\xe0\x01"]
+
+
+@pytest.mark.asyncio
+async def test_power_does_not_cache_form_when_lamp_already_in_target_state() -> None:
+    fake = FakeLamp(accepts_app_power=False)
+    client = _client(fake)
+    async with client:
+        await client.probe(allow_writes=True, response_timeout=0.5)
+        assert client.state is not None and client.state.power is True
+        await client.set_power(True)
+        # The ignored app form "confirmed" trivially; it must not be cached.
+        assert client._power_form is None
+
+
+@pytest.mark.asyncio
+async def test_power_resends_when_first_write_is_dropped() -> None:
+    fake = FakeLamp(drop_power=1)
+    client = _client(fake)
+    async with client:
+        await client.probe(allow_writes=True, response_timeout=0.5)
+        await client.set_power(False)
+        writes = _power_writes(fake)
+        assert len(writes) == 2
+        assert all(len(w) == 8 + 15 for w in writes)
+        assert client.state is not None and client.state.power is False
+        assert client.state.assumed is False
+        assert client._power_form == POWER_FORM_APP
 
 
 @pytest.mark.asyncio

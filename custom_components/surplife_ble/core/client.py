@@ -598,34 +598,37 @@ class LightClient:
         self.state.assumed = True
 
     async def _set_iotbt_power(self, turn_on: bool, probe: ProbeFrame) -> None:
-        """Send the app's switch_led_v3 power, falling back to the legacy form.
+        """Send power and confirm it with a state query, retrying once.
 
-        The confirmed form is cached so later toggles cost one write.
+        The app's switch_led_v3 form is tried first (twice, to cover a dropped
+        write), then the legacy zone form. A form is only cached when the lamp
+        was confirmed in the opposite state beforehand, so a lamp that was
+        already on cannot "confirm" a form it ignored.
         """
-        if self._power_form == POWER_FORM_ZONE:
-            await self._send_inner(iotbt_zone_power(turn_on), probe.transport, note="power")
-            self._mark_power(turn_on)
-            return
-        await self._send_inner(
-            iotbt_power(turn_on),
-            probe.transport,
-            note="power switch_led_v3",
-            command_family=IOTBT_COMMAND_FAMILY,
-        )
-        if self._power_form == POWER_FORM_APP:
-            self._mark_power(turn_on)
-            return
-        await asyncio.sleep(0.15)
-        confirmed = await self.query_state(response_timeout=0.75, allow_reads=False)
-        if confirmed is not None and confirmed.power is turn_on:
-            self._power_form = POWER_FORM_APP
-            return
-        await self._send_inner(iotbt_zone_power(turn_on), probe.transport, note="power zone")
-        await asyncio.sleep(0.15)
-        confirmed = await self.query_state(response_timeout=0.75, allow_reads=False)
-        if confirmed is not None and confirmed.power is turn_on:
-            self._power_form = POWER_FORM_ZONE
-            return
+        prior = None
+        if self.state is not None and not self.state.assumed:
+            prior = self.state.power
+        preferred = self._power_form or POWER_FORM_APP
+        other = POWER_FORM_ZONE if preferred == POWER_FORM_APP else POWER_FORM_APP
+        for form in (preferred, preferred, other):
+            if form == POWER_FORM_ZONE:
+                await self._send_inner(
+                    iotbt_zone_power(turn_on), probe.transport, note="power zone"
+                )
+            else:
+                await self._send_inner(
+                    iotbt_power(turn_on),
+                    probe.transport,
+                    note="power switch_led_v3",
+                    command_family=IOTBT_COMMAND_FAMILY,
+                )
+            await asyncio.sleep(0.15)
+            confirmed = await self.query_state(response_timeout=0.75, allow_reads=False)
+            if confirmed is not None and confirmed.power is turn_on:
+                if prior is not None and prior is not turn_on:
+                    self._power_form = form
+                return
+            _LOGGER.debug("Power %s via %s not confirmed", "on" if turn_on else "off", form)
         self._mark_power(turn_on)
 
     def _mark_power(self, turn_on: bool) -> None:
