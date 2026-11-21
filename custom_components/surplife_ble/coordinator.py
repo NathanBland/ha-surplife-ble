@@ -19,6 +19,13 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import UPDATE_INTERVAL
+from .core.animations import (
+    DEFAULT_COLORS,
+    DEFAULT_SPEED,
+    DIRECTIONS,
+    AnimationCommand,
+    animation_named,
+)
 from .core.client import LightClient
 from .core.models import LightState, apply_assumed_rgb, rgb_state_matches
 from .core.presets import preset_colors
@@ -409,6 +416,8 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
         state = self.data
         if state is None or not state.power or (state.white and state.white > 0):
             return None
+        if self.client is not None and self.client.animation is not None:
+            return None
         segments = self.client.segments if self.client is not None else None
         if segments is not None:
             return [tuple(rgb) for rgb in segments]  # type: ignore[misc]
@@ -422,6 +431,49 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
 
     async def async_set_preset(self, name: str, brightness: int | None = None) -> None:
         await self.async_set_segments(preset_colors(name, self.segment_count), brightness)
+
+    @property
+    def animation(self) -> AnimationCommand | None:
+        """The animation the lamp is running, if one was started."""
+        return self.client.animation if self.client is not None else None
+
+    async def async_set_animation(
+        self,
+        name: str,
+        *,
+        brightness: int | None = None,
+        speed: int | None = None,
+        density: int | None = None,
+        direction: str | None = None,
+        colors: list[tuple[int, int, int]] | None = None,
+        background: tuple[int, int, int] | None = None,
+    ) -> None:
+        """Start a built-in animation; unset options keep the running animation's."""
+        animation = animation_named(name)
+        current = self.animation
+        if brightness is None:
+            brightness = self.data.brightness if self.data and self.data.brightness else 255
+        if direction is not None and direction not in DIRECTIONS:
+            raise ValueError(f"unknown direction {direction!r}")
+        command = AnimationCommand(
+            model=animation.model,
+            colors=tuple(colors) if colors else (current.colors if current else DEFAULT_COLORS),
+            background=background or (current.background if current else (0, 0, 0)),
+            brightness=max(1, round(brightness / 255 * 100)),
+            speed=speed if speed is not None else (current.speed if current else DEFAULT_SPEED),
+            density=density if density is not None else animation.density,
+            direction=(
+                DIRECTIONS[direction]
+                if direction is not None
+                else (current.direction if current else DIRECTIONS["right"])
+            ),
+            model_expand=animation.model_expand,
+            name=animation.name,
+        )
+        if self.data is not None and self.data.power is False:
+            await self.async_set_power(True)
+        await self._async_command("set_animation", command)
+        self._clear_assumed_rgb()
 
     async def async_set_segment_color(self, index: int, rgb: tuple[int, int, int]) -> None:
         """Change one segment, coalescing bursts (scenes) into one lamp write."""

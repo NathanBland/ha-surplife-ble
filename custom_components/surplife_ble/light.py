@@ -27,11 +27,17 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import SurplifeCoordinator
+from .core.animations import ANIMATION_NAMES, DIRECTIONS
 from .core.presets import PRESET_NAMES, matching_preset
 from .core.products import product_for
 
 SERVICE_SET_SEGMENTS = "set_segments"
+SERVICE_SET_ANIMATION = "set_animation"
 ATTR_COLORS = "colors"
+ATTR_BACKGROUND_COLOR = "background_color"
+ATTR_SPEED = "speed"
+ATTR_DENSITY = "density"
+ATTR_DIRECTION = "direction"
 
 _RGB = vol.All(
     vol.ExactSequence((cv.byte, cv.byte, cv.byte)),
@@ -39,6 +45,17 @@ _RGB = vol.All(
 )
 SET_SEGMENTS_SCHEMA = {
     vol.Required(ATTR_COLORS): vol.All(cv.ensure_list, vol.Length(min=1, max=255), [_RGB]),
+    vol.Optional(ATTR_BRIGHTNESS): vol.All(vol.Coerce(int), vol.Range(min=1, max=255)),
+}
+
+_PERCENT = vol.All(vol.Coerce(int), vol.Range(min=0, max=100))
+SET_ANIMATION_SCHEMA = {
+    vol.Required(ATTR_EFFECT): vol.In(ANIMATION_NAMES),
+    vol.Optional(ATTR_SPEED): _PERCENT,
+    vol.Optional(ATTR_DENSITY): _PERCENT,
+    vol.Optional(ATTR_DIRECTION): vol.In(list(DIRECTIONS)),
+    vol.Optional(ATTR_COLORS): vol.All(cv.ensure_list, vol.Length(min=1, max=16), [_RGB]),
+    vol.Optional(ATTR_BACKGROUND_COLOR): _RGB,
     vol.Optional(ATTR_BRIGHTNESS): vol.All(vol.Coerce(int), vol.Range(min=1, max=255)),
 }
 
@@ -70,6 +87,9 @@ async def async_setup_entry(
     platform = entity_platform.async_get_current_platform()
     platform.async_register_entity_service(
         SERVICE_SET_SEGMENTS, SET_SEGMENTS_SCHEMA, "async_set_segments"
+    )
+    platform.async_register_entity_service(
+        SERVICE_SET_ANIMATION, SET_ANIMATION_SCHEMA, "async_set_animation"
     )
 
 
@@ -118,9 +138,15 @@ class SurplifeLight(CoordinatorEntity[SurplifeCoordinator], LightEntity):
         client = self.coordinator.client
         if _supports_segments(self.coordinator):
             self._attr_supported_features = LightEntityFeature.EFFECT
-            self._attr_effect_list = [EFFECT_OFF, *PRESET_NAMES]
-            preset = None if is_white else matching_preset(client.segments if client else None)
-            self._attr_effect = preset or EFFECT_OFF
+            self._attr_effect_list = [EFFECT_OFF, *PRESET_NAMES, *ANIMATION_NAMES]
+            animation = self.coordinator.animation
+            if is_white:
+                effect = None
+            elif animation is not None:
+                effect = animation.name
+            else:
+                effect = matching_preset(client.segments if client else None)
+            self._attr_effect = effect or EFFECT_OFF
         else:
             self._attr_supported_features = LightEntityFeature(0)
             self._attr_effect_list = None
@@ -164,9 +190,12 @@ class SurplifeLight(CoordinatorEntity[SurplifeCoordinator], LightEntity):
         )
         effect = cast(str | None, kwargs.get(ATTR_EFFECT))
         if effect is not None and effect != EFFECT_OFF:
-            if effect not in PRESET_NAMES:
+            if effect in PRESET_NAMES:
+                await self.coordinator.async_set_preset(effect, requested_brightness)
+            elif effect in ANIMATION_NAMES:
+                await self._async_animate(effect, brightness=requested_brightness)
+            else:
                 raise HomeAssistantError(f"unknown effect {effect}")
-            await self.coordinator.async_set_preset(effect, requested_brightness)
         elif effect == EFFECT_OFF and ATTR_RGB_COLOR not in kwargs:
             rgb = self.rgb_color or (255, 255, 255)
             await self.coordinator.async_set_rgb(rgb, brightness)
@@ -192,6 +221,35 @@ class SurplifeLight(CoordinatorEntity[SurplifeCoordinator], LightEntity):
             raise HomeAssistantError("this light does not support per-segment colour")
         try:
             await self.coordinator.async_set_segments(list(colors), brightness)
+        except (RuntimeError, ValueError) as err:
+            raise HomeAssistantError(str(err)) from err
+
+    async def async_set_animation(
+        self,
+        effect: str,
+        speed: int | None = None,
+        density: int | None = None,
+        direction: str | None = None,
+        colors: list[tuple[int, int, int]] | None = None,
+        background_color: tuple[int, int, int] | None = None,
+        brightness: int | None = None,
+    ) -> None:
+        """Start a built-in animation with custom options (entity service)."""
+        if not _supports_segments(self.coordinator):
+            raise HomeAssistantError("this light does not support animations")
+        await self._async_animate(
+            effect,
+            brightness=brightness,
+            speed=speed,
+            density=density,
+            direction=direction,
+            colors=list(colors) if colors else None,
+            background=background_color,
+        )
+
+    async def _async_animate(self, effect: str, **options: Any) -> None:
+        try:
+            await self.coordinator.async_set_animation(effect, **options)
         except (RuntimeError, ValueError) as err:
             raise HomeAssistantError(str(err)) from err
 

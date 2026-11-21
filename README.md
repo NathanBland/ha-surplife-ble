@@ -15,6 +15,7 @@ It supports the MIHEAL DX23012 floor lamp and similar devices that use the IOTBT
 | White brightness | Needs hardware retest |
 | Overall brightness | Verified on one DX23012 |
 | Per-segment color (`surplife_ble.set_segments`) | Beta, needs hardware test |
+| Animations (`surplife_ble.set_animation`) | Beta, needs hardware test |
 | State confirmation | Verified on one DX23012 |
 | Multiple devices | Supported |
 | Automatic discovery | Supported |
@@ -90,6 +91,35 @@ data:
 
 The integration asks the lamp for its segment count once and uses 20 if the lamp does not answer.
 Brightness changes keep the pattern. A single color or white replaces it.
+
+### Animations (beta)
+
+The **Effect** list also has the lamp's built-in animations, decoded from the Surplife app:
+Breathe, Alternate breath, Async breathe, Cycle, Sync gradient, Async gradient, Rainbow bridge,
+Gradient overlay, Wave, Meteor, Gradient meteor, Comet, Streamer, Running water, Chase,
+Horse racing, Building blocks, Faster light, Volcano, Collision, Fireworks, Jump, Sharp flash,
+Twinkling stars, Stars wink and Warning. Picking one from the Effect list uses a rainbow
+palette at speed 50.
+
+The `surplife_ble.set_animation` action sets the speed, density, direction (right, left,
+open or close) and colors yourself. Options you leave out keep the running animation's values.
+
+```yaml
+action: surplife_ble.set_animation
+target:
+  entity_id: light.floor_lamp
+data:
+  effect: Breathe
+  speed: 30
+  colors:
+    - [255, 0, 80]
+    - [0, 80, 255]
+```
+
+Brightness changes resend the animation at the new brightness. A single color, a preset or
+white stops it. While an animation runs, the segment lights show as off.
+Not every lamp may accept every animation. Alternate breath, Async breathe and the two
+gradient effects come from the app's newer effect list.
 
 ## Known limitations
 

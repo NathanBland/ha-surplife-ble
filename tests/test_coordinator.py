@@ -440,7 +440,7 @@ def _segment_coordinator(monkeypatch: pytest.MonkeyPatch, state: LightState) -> 
     monkeypatch.setattr(module, "_SEGMENT_COALESCE_SECONDS", 0)
     coordinator = module.SurplifeCoordinator(FakeHass(), FakeEntry())
     coordinator.data = state
-    coordinator.client = SimpleNamespace(segment_count=4, segments=None)
+    coordinator.client = SimpleNamespace(segment_count=4, segments=None, animation=None)
     calls: list[tuple[Any, ...]] = []
 
     async def set_segments(colors: list[tuple[int, int, int]], brightness: int | None) -> None:

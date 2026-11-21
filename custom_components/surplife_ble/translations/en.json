@@ -41,6 +41,40 @@
           "description": "Brightness from 1 to 255. Defaults to the current brightness."
         }
       }
+    },
+    "set_animation": {
+      "name": "Set animation",
+      "description": "Start one of the lamp's built-in animations with custom speed, density, direction and colors.",
+      "fields": {
+        "effect": {
+          "name": "Effect",
+          "description": "Built-in animation to run."
+        },
+        "speed": {
+          "name": "Speed",
+          "description": "Animation speed from 0 to 100. Defaults to 50, or the running animation's speed."
+        },
+        "density": {
+          "name": "Density",
+          "description": "Pattern density from 0 to 100. Defaults to the app's value for the effect."
+        },
+        "direction": {
+          "name": "Direction",
+          "description": "Direction of motion."
+        },
+        "colors": {
+          "name": "Colors",
+          "description": "List of up to 16 [red, green, blue] colors. Defaults to a rainbow, or the running animation's colors."
+        },
+        "background_color": {
+          "name": "Background color",
+          "description": "Color behind the moving pattern. Defaults to black."
+        },
+        "brightness": {
+          "name": "Brightness",
+          "description": "Brightness from 1 to 255. Defaults to the current brightness."
+        }
+      }
     }
   },
   "entity": {

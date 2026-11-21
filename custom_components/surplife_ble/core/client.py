@@ -7,12 +7,14 @@ import inspect
 import logging
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
+from dataclasses import replace
 from typing import Any, Protocol
 
 from bleak import BleakClient
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 
+from .animations import AnimationCommand
 from .capture import JsonlCapture
 from .framing import NotificationReassembler, SequenceCounter, segment_magichome
 from .models import (
@@ -41,6 +43,7 @@ from .protocol import (
     extended_zone_power_off,
     frame_for_transport,
     iotbt_3b_white,
+    iotbt_e1_animation,
     iotbt_e1_segment_rgb,
     iotbt_e1_segments,
     iotbt_power,
@@ -118,6 +121,7 @@ class LightClient:
         self._power_form: str | None = None
         # Per-segment colours last sent, kept across state refreshes.
         self._segments: tuple[tuple[int, int, int], ...] | None = None
+        self._animation: AnimationCommand | None = None
 
     @property
     def connected(self) -> bool:
@@ -720,6 +724,7 @@ class LightClient:
             command_family=IOTBT_COMMAND_FAMILY,
         )
         self._segments = stretched  # type: ignore[assignment]
+        self._animation = None
         self.state = LightState(
             power=True,
             rgb=stretched[0],  # type: ignore[arg-type]
@@ -738,6 +743,57 @@ class LightClient:
         await self._confirm_rgb_state(stretched[0], round(brightness * 255 / 100))  # type: ignore[arg-type]
         if self.state is not None:
             self.state.segments = self._segments
+
+    @property
+    def animation(self) -> AnimationCommand | None:
+        """The animation last sent, or None after a colour or white command."""
+        return self._animation
+
+    async def set_animation(self, command: AnimationCommand) -> None:
+        """Start one of the lamp's built-in animations with an E1 01 command."""
+        resolution, probe = self._require_control_resolution()
+        if resolution.codec != "iotbt-ea81":
+            raise RuntimeError("animations need an IOTBT symphony lamp")
+        brightness = max(1, min(100, command.brightness))
+        command = replace(command, brightness=brightness)
+        payload = iotbt_e1_animation(
+            command.model,
+            command.colors,
+            background=command.background,
+            brightness=brightness,
+            speed=command.speed,
+            density=command.density,
+            direction=command.direction,
+            model_expand=command.model_expand,
+        )
+        self._flush_notifications()
+        await self._send_inner(
+            payload,
+            probe.transport,
+            note=f"set animation e1 01 model {command.model}",
+            command_family=IOTBT_COMMAND_FAMILY,
+        )
+        self._segments = None
+        self._animation = command
+        commanded = LightState(
+            power=True,
+            rgb=command.colors[0],
+            brightness=round(brightness * 255 / 100),
+            white=0,
+            model_num=resolution.model_num,
+            firmware_version=resolution.firmware_version,
+            product_id=resolution.product_id,
+            assumed=True,
+        )
+        self.state = commanded
+        # Give the lamp the same state round trip as after a segment write, and
+        # log what it reports while animating (not yet known).
+        reply = await self.query_state(response_timeout=0.75, allow_reads=False)
+        if reply is not None:
+            _LOGGER.debug("State while animating model %s: %s", command.model, reply.raw_hex)
+            if reply.power is not None:
+                commanded.power = reply.power
+        self.state = commanded
 
     async def set_rgb(
         self,
@@ -765,6 +821,7 @@ class LightClient:
             )
             expected_brightness = round(brightness * 255 / 100)
             self._segments = None
+            self._animation = None
             self._flush_notifications()
             await self._send_inner(
                 payload,
@@ -853,6 +910,7 @@ class LightClient:
         elif resolution.codec == "iotbt-ea81":
             payload = iotbt_3b_white(brightness)
             self._segments = None
+            self._animation = None
             await self._send_inner(
                 payload,
                 probe.transport,
@@ -883,7 +941,11 @@ class LightClient:
             # The 3B 01 standalone brightness command is not accepted by this
             # device. Re-send the current color or white command with the new
             # brightness, which is what the official app does.
-            if self.state and self.state.white:
+            if self._animation is not None:
+                await self.set_animation(
+                    replace(self._animation, brightness=brightness)
+                )
+            elif self.state and self.state.white:
                 await self.set_white(brightness)
             elif self._segments is not None:
                 await self.set_segments(self._segments, brightness=brightness)

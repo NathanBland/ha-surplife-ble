@@ -51,6 +51,10 @@ IOTBT_CMD_E1_PREFIX = 0xE1
 IOTBT_CMD_E1_SEGMENT_OP = 0x03
 IOTBT_CMD_E1_SEGMENT_RECORD = 0xA1
 IOTBT_SEGMENT_COUNT = 20
+# E1 01 symphony animation ("custom mode") command, from the app's
+# buildSymphonyCustomHEXCommand. See docs/protocol-apk-1.6.5.md section 10.
+IOTBT_CMD_E1_ANIMATION_OP = 0x01
+IOTBT_ANIMATION_MAX_COLORS = 16
 
 # BLE command ID (the wrapper's "family" byte) for the unified 3B/E0/E1 light
 # commands. The Surplife app's ble_dp_cmd.json gives bright_value_v2 opcode 11,
@@ -737,3 +741,59 @@ def frame_for_transport(
             length_bias=2,
         )
     raise ValueError(f"unsupported transport: {transport}")
+
+
+def _e1_color_record(rgb: Sequence[int]) -> bytes:
+    """An E1 colour record whose value byte comes from the colour's peak channel."""
+    if len(rgb) != 3:
+        raise ValueError("each colour must be an (r, g, b) triple")
+    peak = max(clamp(part, 0, 255) for part in rgb)
+    return _e1_record(rgb, round(peak * 100 / 255))
+
+
+def iotbt_e1_animation(
+    model: int,
+    colors: Sequence[Sequence[int]],
+    *,
+    background: Sequence[int] = (0, 0, 0),
+    brightness: int = 80,
+    speed: int = 50,
+    density: int = 25,
+    direction: int = 1,
+    model_expand: int = 0,
+) -> bytes:
+    """Build the app's E1 01 symphony animation command.
+
+    Format (from ``buildSymphonyCustomHEXCommand`` in app 1.6.5)::
+
+      E1 01 00 <brightness> <model> <modelExpand> <direction> <density> <speed> 00
+               <background record> <foreground count> <foreground records...>
+
+    Records are the E1 03 ``A1 <hs hi> <hs lo> <value>`` form. Brightness,
+    speed and density are 0-100; direction 1 is right and 2 is left.
+    Decoded from the app but not yet confirmed on a lamp.
+    """
+    if not 1 <= model <= 255:
+        raise ValueError("model must be between 1 and 255")
+    if not 1 <= len(colors) <= IOTBT_ANIMATION_MAX_COLORS:
+        raise ValueError(f"an animation needs 1-{IOTBT_ANIMATION_MAX_COLORS} colours")
+    header = bytes(
+        (
+            IOTBT_CMD_E1_PREFIX,
+            IOTBT_CMD_E1_ANIMATION_OP,
+            0x00,
+            clamp(brightness, 0, 100),
+            model,
+            clamp(model_expand, 0, 255),
+            clamp(direction, 0, 255),
+            clamp(density, 0, 100),
+            clamp(speed, 0, 100),
+            0x00,
+        )
+    )
+    return (
+        header
+        + _e1_color_record(background)
+        + bytes((len(colors),))
+        + b"".join(_e1_color_record(rgb) for rgb in colors)
+    )

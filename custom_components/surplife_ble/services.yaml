@@ -15,3 +15,78 @@ set_segments:
         number:
           min: 1
           max: 255
+set_animation:
+  target:
+    entity:
+      integration: surplife_ble
+      domain: light
+  fields:
+    effect:
+      required: true
+      example: "Breathe"
+      selector:
+        select:
+          options:
+            - "Breathe"
+            - "Alternate breath"
+            - "Async breathe"
+            - "Cycle"
+            - "Sync gradient"
+            - "Async gradient"
+            - "Rainbow bridge"
+            - "Gradient overlay"
+            - "Wave"
+            - "Meteor"
+            - "Gradient meteor"
+            - "Comet"
+            - "Streamer"
+            - "Running water"
+            - "Chase"
+            - "Horse racing"
+            - "Building blocks"
+            - "Faster light"
+            - "Volcano"
+            - "Collision"
+            - "Fireworks"
+            - "Jump"
+            - "Sharp flash"
+            - "Twinkling stars"
+            - "Stars wink"
+            - "Warning"
+    speed:
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 100
+    density:
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 100
+    direction:
+      required: false
+      selector:
+        select:
+          options:
+            - "right"
+            - "left"
+            - "open"
+            - "close"
+    colors:
+      required: false
+      example: "[[255, 0, 0], [0, 0, 255]]"
+      selector:
+        object:
+    background_color:
+      required: false
+      example: "[0, 0, 0]"
+      selector:
+        color_rgb:
+    brightness:
+      required: false
+      selector:
+        number:
+          min: 1
+          max: 255
