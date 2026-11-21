@@ -7,10 +7,13 @@ from typing import Any, cast
 import voluptuous as vol
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
+    ATTR_EFFECT,
     ATTR_RGB_COLOR,
     ATTR_WHITE,
+    EFFECT_OFF,
     ColorMode,
     LightEntity,
+    LightEntityFeature,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
@@ -24,6 +27,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import SurplifeCoordinator
+from .core.presets import PRESET_NAMES, matching_preset
 from .core.products import product_for
 
 SERVICE_SET_SEGMENTS = "set_segments"
@@ -44,12 +48,39 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Create one whole-lamp entity."""
-    async_add_entities([SurplifeLight(entry.runtime_data.coordinator, entry)])
+    """Create the whole-lamp entity, plus segment entities once supported."""
+    coordinator: SurplifeCoordinator = entry.runtime_data.coordinator
+    async_add_entities([SurplifeLight(coordinator, entry)])
+    added_segments = False
+
+    @callback
+    def _async_add_segments() -> None:
+        nonlocal added_segments
+        if added_segments or not _supports_segments(coordinator):
+            return
+        added_segments = True
+        async_add_entities(
+            SurplifeSegmentLight(coordinator, index)
+            for index in range(coordinator.segment_count)
+        )
+
+    # Segment support is only known after the first poll identifies the lamp.
+    entry.async_on_unload(coordinator.async_add_listener(_async_add_segments))
+    _async_add_segments()
     platform = entity_platform.async_get_current_platform()
     platform.async_register_entity_service(
         SERVICE_SET_SEGMENTS, SET_SEGMENTS_SCHEMA, "async_set_segments"
     )
+
+
+def _supports_segments(coordinator: SurplifeCoordinator) -> bool:
+    client = coordinator.client
+    resolution = client.resolution if client is not None else None
+    return resolution is not None and "segments" in resolution.capabilities
+
+
+def _device_info(coordinator: SurplifeCoordinator) -> DeviceInfo:
+    return DeviceInfo(identifiers={(DOMAIN, coordinator.address)})
 
 
 class SurplifeLight(CoordinatorEntity[SurplifeCoordinator], LightEntity):
@@ -85,6 +116,15 @@ class SurplifeLight(CoordinatorEntity[SurplifeCoordinator], LightEntity):
         self._attr_color_mode = ColorMode.WHITE if is_white else ColorMode.RGB
         self._attr_assumed_state = state.assumed
         client = self.coordinator.client
+        if _supports_segments(self.coordinator):
+            self._attr_supported_features = LightEntityFeature.EFFECT
+            self._attr_effect_list = [EFFECT_OFF, *PRESET_NAMES]
+            preset = None if is_white else matching_preset(client.segments if client else None)
+            self._attr_effect = preset or EFFECT_OFF
+        else:
+            self._attr_supported_features = LightEntityFeature(0)
+            self._attr_effect_list = None
+            self._attr_effect = None
         product = product_for(state.product_id) if state.product_id is not None else None
         attributes: dict[str, Any] = {}
         if product is not None:
@@ -122,7 +162,15 @@ class SurplifeLight(CoordinatorEntity[SurplifeCoordinator], LightEntity):
             if requested_brightness is not None
             else self.brightness if self.brightness is not None else 255
         )
-        if ATTR_RGB_COLOR in kwargs:
+        effect = cast(str | None, kwargs.get(ATTR_EFFECT))
+        if effect is not None and effect != EFFECT_OFF:
+            if effect not in PRESET_NAMES:
+                raise HomeAssistantError(f"unknown effect {effect}")
+            await self.coordinator.async_set_preset(effect, requested_brightness)
+        elif effect == EFFECT_OFF and ATTR_RGB_COLOR not in kwargs:
+            rgb = self.rgb_color or (255, 255, 255)
+            await self.coordinator.async_set_rgb(rgb, brightness)
+        elif ATTR_RGB_COLOR in kwargs:
             await self.coordinator.async_set_rgb(kwargs[ATTR_RGB_COLOR], brightness)
         elif ATTR_WHITE in kwargs:
             requested_white = cast(int | None, kwargs[ATTR_WHITE])
@@ -149,6 +197,68 @@ class SurplifeLight(CoordinatorEntity[SurplifeCoordinator], LightEntity):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         await self.coordinator.async_set_power(False)
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._async_update_attrs()
+        self.async_write_ha_state()
+
+
+class SurplifeSegmentLight(CoordinatorEntity[SurplifeCoordinator], LightEntity):
+    """One addressable segment of a symphony lamp (segment 1 is the top).
+
+    The lamp has a single brightness, so a segment's brightness is applied by
+    scaling its colour.
+    """
+
+    _attr_has_entity_name = True
+    _attr_supported_color_modes = {ColorMode.RGB}
+    _attr_color_mode = ColorMode.RGB
+    _attr_translation_key = "segment"
+
+    def __init__(self, coordinator: SurplifeCoordinator, index: int) -> None:
+        super().__init__(coordinator)
+        self._index = index
+        self._attr_unique_id = f"{coordinator.address}-segment-{index + 1}"
+        self._attr_translation_placeholders = {"number": str(index + 1)}
+        self._attr_device_info = _device_info(coordinator)
+        self._async_update_attrs()
+
+    @callback
+    def _async_update_attrs(self) -> None:
+        colors = self.coordinator.segment_colors()
+        rgb = colors[self._index] if colors is not None and self._index < len(colors) else None
+        state = self.coordinator.data
+        self._attr_assumed_state = bool(state and state.assumed)
+        if rgb is None or max(rgb) == 0:
+            self._attr_is_on = False if state is not None else None
+            return
+        peak = max(rgb)
+        self._attr_is_on = True
+        self._attr_rgb_color = tuple(round(part * 255 / peak) for part in rgb)  # type: ignore[assignment]
+        self._attr_brightness = peak
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        rgb = cast(
+            tuple[int, int, int],
+            kwargs.get(ATTR_RGB_COLOR) or self.rgb_color or (255, 255, 255),
+        )
+        brightness = cast(int | None, kwargs.get(ATTR_BRIGHTNESS))
+        if brightness is None:
+            brightness = self.brightness if self.is_on and self.brightness else 255
+        scaled = tuple(round(part * brightness / 255) for part in rgb)
+        if max(scaled) == 0:
+            scaled = (1, 1, 1)
+        await self._async_set(scaled)  # type: ignore[arg-type]
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await self._async_set((0, 0, 0))
+
+    async def _async_set(self, rgb: tuple[int, int, int]) -> None:
+        try:
+            await self.coordinator.async_set_segment_color(self._index, rgb)
+        except (RuntimeError, ValueError) as err:
+            raise HomeAssistantError(str(err)) from err
 
     @callback
     def _handle_coordinator_update(self) -> None:

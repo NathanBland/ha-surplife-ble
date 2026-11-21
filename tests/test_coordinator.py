@@ -433,3 +433,102 @@ async def test_poll_reconnects_during_command_cooldown(
     assert coordinator._connect_failed_at is None
     await coordinator._async_command("set_power", False)
     assert client.connects == 3
+
+
+def _segment_coordinator(monkeypatch: pytest.MonkeyPatch, state: LightState) -> Any:
+    module = _load_coordinator(monkeypatch)
+    monkeypatch.setattr(module, "_SEGMENT_COALESCE_SECONDS", 0)
+    coordinator = module.SurplifeCoordinator(FakeHass(), FakeEntry())
+    coordinator.data = state
+    coordinator.client = SimpleNamespace(segment_count=4, segments=None)
+    calls: list[tuple[Any, ...]] = []
+
+    async def set_segments(colors: list[tuple[int, int, int]], brightness: int | None) -> None:
+        calls.append(("segments", list(colors), brightness))
+        coordinator.client.segments = tuple(colors)
+        await asyncio.sleep(0)
+
+    async def set_power(turn_on: bool) -> None:
+        calls.append(("power", turn_on))
+
+    coordinator.async_set_segments = set_segments
+    coordinator.async_set_power = set_power
+    return coordinator, calls
+
+
+@pytest.mark.asyncio
+async def test_segment_colors_follow_solid_colour_and_white_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, _calls = _segment_coordinator(
+        monkeypatch, LightState(power=True, rgb=(255, 0, 0), brightness=255, white=0)
+    )
+    assert coordinator.segment_colors() == [(255, 0, 0)] * 4
+    coordinator.data = LightState(power=True, rgb=(255, 0, 0), brightness=255, white=200)
+    assert coordinator.segment_colors() is None
+    coordinator.data = LightState(power=False, rgb=(255, 0, 0), brightness=255, white=0)
+    assert coordinator.segment_colors() is None
+
+
+@pytest.mark.asyncio
+async def test_segment_burst_is_coalesced_into_one_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, calls = _segment_coordinator(
+        monkeypatch, LightState(power=True, rgb=(255, 0, 0), brightness=255, white=0)
+    )
+    await asyncio.gather(
+        coordinator.async_set_segment_color(0, (0, 0, 255)),
+        coordinator.async_set_segment_color(3, (0, 255, 0)),
+    )
+    assert calls == [
+        ("segments", [(0, 0, 255), (255, 0, 0), (255, 0, 0), (0, 255, 0)], None)
+    ]
+    await coordinator.async_set_segment_color(1, (9, 9, 9))
+    assert calls[-1] == (
+        "segments",
+        [(0, 0, 255), (9, 9, 9), (255, 0, 0), (0, 255, 0)],
+        None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_turning_off_every_segment_turns_the_lamp_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, calls = _segment_coordinator(
+        monkeypatch, LightState(power=True, rgb=(255, 0, 0), brightness=255, white=0)
+    )
+    coordinator.client.segments = ((0, 0, 0), (0, 0, 0), (5, 5, 5), (0, 0, 0))
+    await coordinator.async_set_segment_color(2, (0, 0, 0))
+    assert calls == [("power", False)]
+
+
+@pytest.mark.asyncio
+async def test_segment_index_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    coordinator, _calls = _segment_coordinator(
+        monkeypatch, LightState(power=True, rgb=(255, 0, 0), brightness=255, white=0)
+    )
+    with pytest.raises(ValueError):
+        await coordinator.async_set_segment_color(4, (1, 1, 1))
+
+
+@pytest.mark.asyncio
+async def test_set_segments_powers_on_an_off_lamp_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_coordinator(monkeypatch)
+    coordinator = module.SurplifeCoordinator(FakeHass(), FakeEntry())
+    coordinator.data = LightState(power=False, rgb=(255, 0, 0), brightness=255, white=0)
+    order: list[str] = []
+
+    async def set_power(_turn_on: bool) -> None:
+        order.append("power")
+
+    async def command(method: str, *_args: Any, **_kwargs: Any) -> None:
+        order.append(method)
+
+    coordinator.async_set_power = set_power
+    coordinator._async_command = command
+    await coordinator.async_set_preset("Rainbow")
+    assert order == ["power", "set_segments"]

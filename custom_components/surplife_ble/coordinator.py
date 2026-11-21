@@ -21,10 +21,13 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .const import UPDATE_INTERVAL
 from .core.client import LightClient
 from .core.models import LightState, apply_assumed_rgb, rgb_state_matches
+from .core.presets import preset_colors
 
 _LOGGER = logging.getLogger(__name__)
 _ASSUMED_RGB_SECONDS = 5.0
 _CONFIRMATION_DELAY_SECONDS = 0.3
+# Segment changes arriving this close together (a scene) share one write.
+_SEGMENT_COALESCE_SECONDS = 0.1
 # Upper bound for the GATT work of one poll or command once connected. The
 # connection itself is bounded by bleak_retry_connector, which needs longer on
 # Bluetooth proxies, so it is not included.
@@ -97,6 +100,10 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
         self._strip_profile_attempted = False
         self._next_probe_at: float | None = None
         self._connect_failed_at: float | None = None
+        self._segment_target: list[tuple[int, int, int]] | None = None
+        self._segment_generation = 0
+        self._segment_sent_generation = 0
+        self._segment_lock = asyncio.Lock()
 
     def async_set_ble_device(
         self, device: BLEDevice, advertisement: AdvertisementData | None
@@ -385,10 +392,58 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
     ) -> None:
         if brightness is None:
             brightness = self.data.brightness if self.data and self.data.brightness else 255
+        if self.data is not None and self.data.power is False:
+            # Segment writes are not known to wake the lamp; power it on first.
+            await self.async_set_power(True)
         await self._async_command(
             "set_segments", colors, brightness=max(1, round(brightness / 255 * 100))
         )
         self._clear_assumed_rgb()
+
+    @property
+    def segment_count(self) -> int:
+        return self.client.segment_count if self.client is not None else 20
+
+    def segment_colors(self) -> list[tuple[int, int, int]] | None:
+        """What each segment shows now, or None when the lamp is off or white."""
+        state = self.data
+        if state is None or not state.power or (state.white and state.white > 0):
+            return None
+        segments = self.client.segments if self.client is not None else None
+        if segments is not None:
+            return [tuple(rgb) for rgb in segments]  # type: ignore[misc]
+        if state.rgb is None:
+            return None
+        return [tuple(state.rgb)] * self.segment_count  # type: ignore[list-item]
+
+    async def async_set_preset(self, name: str, brightness: int | None = None) -> None:
+        await self.async_set_segments(preset_colors(name, self.segment_count), brightness)
+
+    async def async_set_segment_color(self, index: int, rgb: tuple[int, int, int]) -> None:
+        """Change one segment, coalescing bursts (scenes) into one lamp write."""
+        count = self.segment_count
+        if not 0 <= index < count:
+            raise ValueError(f"segment {index + 1} is outside 1-{count}")
+        if self._segment_target is None or len(self._segment_target) != count:
+            self._segment_target = self.segment_colors() or [(0, 0, 0)] * count
+        self._segment_target[index] = tuple(rgb)  # type: ignore[assignment]
+        self._segment_generation += 1
+        generation = self._segment_generation
+        await asyncio.sleep(_SEGMENT_COALESCE_SECONDS)
+        async with self._segment_lock:
+            if self._segment_sent_generation >= generation:
+                return
+            target = list(self._segment_target)
+            sent = self._segment_generation
+            try:
+                if any(target_rgb != (0, 0, 0) for target_rgb in target):
+                    await self.async_set_segments(target, None)
+                else:
+                    await self.async_set_power(False)
+            finally:
+                self._segment_sent_generation = sent
+                if self._segment_generation == sent:
+                    self._segment_target = None
 
     async def async_set_power(self, turn_on: bool) -> None:
         await self._async_command("set_power", turn_on)

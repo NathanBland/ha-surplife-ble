@@ -61,6 +61,19 @@ Configure the integration through the UI:
 
 ### Per-segment color (beta)
 
+Lamps that support segments get two extra controls:
+
+- **Presets.** The main light's **Effect** list has named patterns: Rainbow, Sunset, Ocean,
+  Forest, Fire, Aurora, Candy cane and Red / blue. Choose **off** to go back to a single color.
+- **Segment lights.** One light entity per segment, named "Segment 1" (top) to "Segment 20" (bottom).
+  Each has its own color picker. Segment brightness scales that segment's color, because the lamp has
+  one brightness. Changes made together, such as from a scene, go out as one write.
+  Turning every segment off turns the lamp off.
+
+The segment lights appear after the integration first reaches the lamp.
+The lamp does not report segment colors, so after a restart each segment shows the lamp's single color
+until a pattern is set again.
+
 The `surplife_ble.set_segments` action gives each segment of the lamp its own color.
 A shorter list is spread evenly, so two colors split the lamp in half.
 

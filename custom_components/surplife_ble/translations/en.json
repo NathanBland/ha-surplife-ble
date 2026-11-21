@@ -42,5 +42,12 @@
         }
       }
     }
+  },
+  "entity": {
+    "light": {
+      "segment": {
+        "name": "Segment {number}"
+      }
+    }
   }
 }
