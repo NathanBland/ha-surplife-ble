@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
 from typing import Any, Protocol
@@ -49,6 +50,8 @@ from .protocol import (
     parse_symphony_config,
     probe_frames,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 ClientFactory = Callable[[BLEDevice], Any | Awaitable[Any]]
 
@@ -667,8 +670,13 @@ class LightClient:
                     break
                 profile = parse_symphony_config(packet)
                 if profile is not None:
+                    _LOGGER.debug("Strip profile reply (cmd %#04x): %s", family, packet.hex())
                     self.strip_profile = profile
                     return profile
+                _LOGGER.debug(
+                    "Unparsed reply to strip profile query (cmd %#04x): %s", family, packet.hex()
+                )
+        _LOGGER.debug("No strip profile reply; using %s segments", IOTBT_SEGMENT_COUNT)
         return None
 
     async def set_segments(
@@ -715,13 +723,12 @@ class LightClient:
             assumed=True,
         )
         # The lamp needs a state round trip before it accepts the next long
-        # segment write.
-        optimistic = self.state
-        confirmed = await self.query_state(response_timeout=0.75, allow_reads=False)
-        if confirmed is not None:
-            confirmed.segments = self._segments
-            if confirmed.power is not True:
-                self.state = optimistic
+        # segment write. Its first reply can still describe the previous
+        # colours, so only a reply matching the first segment replaces the
+        # commanded state.
+        await self._confirm_rgb_state(stretched[0], round(brightness * 255 / 100))  # type: ignore[arg-type]
+        if self.state is not None:
+            self.state.segments = self._segments
 
     async def set_rgb(
         self,

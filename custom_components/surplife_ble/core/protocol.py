@@ -28,6 +28,8 @@ IOTBT_POS_COLOR_TEMP = 8
 IOTBT_POS_HUE = 11
 IOTBT_POS_SATURATION = 12
 IOTBT_POS_BRIGHTNESS = 13
+# White level in percent. The lamp keeps it in colour mode too.
+IOTBT_POS_WHITE_BRIGHTNESS = 15
 IOTBT_COLOR_MODE = 0x24
 IOTBT_WHITE_MODE = 0x25
 
@@ -247,11 +249,14 @@ def parse_state(packet: bytes) -> LightState | None:
             value = clamp(state[IOTBT_POS_BRIGHTNESS], 0, 100) / 100
             red_f, green_f, blue_f = colorsys.hsv_to_rgb(hue, saturation, value)
             is_white_mode = state[IOTBT_POS_COLOR_WHITE_MODE] == IOTBT_WHITE_MODE
-            white_percent = value * 100 if is_white_mode else 0
+            white_percent = (
+                clamp(state[IOTBT_POS_WHITE_BRIGHTNESS], 0, 100) if is_white_mode else 0
+            )
+            brightness_percent = white_percent if is_white_mode else value * 100
             return LightState(
                 power=state[IOTBT_POS_POWER] == POWER_ON,
                 rgb=(round(red_f * 255), round(green_f * 255), round(blue_f * 255)),
-                brightness=round(value * 255),
+                brightness=round(brightness_percent * 255 / 100),
                 white=round(white_percent * 255 / 100),
                 model_num=None,
                 firmware_version=None,

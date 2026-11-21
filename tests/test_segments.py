@@ -286,3 +286,45 @@ async def test_unknown_mtu_keeps_single_write() -> None:
         before = len(fake.writes)
         await client.set_segments([(255, 0, 0)] * 20)
         assert not any(d[0] & 0x40 for _u, d, _r in fake.writes[before:])
+
+
+# --- hardware regressions (DX23012 IOTBT04F, 2026-11-20) ----------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "brightness"),
+    [
+        ("ea810100aa0923256f32f0006464001705001dffffffff01000000", round(23 * 255 / 100)),
+        ("ea810100aa0923256f32f0006464006405001dffffffff01000000", 255),
+    ],
+)
+def test_white_mode_brightness_comes_from_byte_15(raw: str, brightness: int) -> None:
+    from custom_components.surplife_ble.core.protocol import parse_state
+
+    state = parse_state(bytes.fromhex(raw))
+    assert state is not None
+    assert state.white == brightness
+    assert state.brightness == brightness
+
+
+def test_colour_mode_ignores_stored_white_level() -> None:
+    from custom_components.surplife_ble.core.protocol import parse_state
+
+    state = parse_state(bytes.fromhex("ea810100aa0923240132f000642f004605001dffffffff01000000"))
+    assert state is not None
+    assert state.white == 0
+    assert state.brightness == round(0x2F * 255 / 100)
+
+
+@pytest.mark.asyncio
+async def test_set_segments_keeps_commanded_state_over_stale_reply() -> None:
+    fake = FakeLamp()
+    client = _client(fake)
+    async with client:
+        await client.probe(allow_writes=True, response_timeout=0.5)
+        await client.set_segments([(0, 0, 255), (255, 0, 0)], brightness=100)
+        # The fake keeps reporting red, like the lamp's stale first reply.
+        assert client.state is not None
+        assert client.state.rgb == (0, 0, 255)
+        assert client.state.assumed
+        assert client.state.segments == client.segments
