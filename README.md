@@ -14,8 +14,8 @@ It supports the MIHEAL DX23012 floor lamp and similar devices that use the IOTBT
 | RGB color | Verified on one DX23012 |
 | White brightness | Needs hardware retest |
 | Overall brightness | Verified on one DX23012 |
-| Per-segment color (`surplife_ble.set_segments`) | Beta, needs hardware test |
-| Animations (`surplife_ble.set_animation`) | Beta, needs hardware test |
+| Per-segment color (`surplife_ble.set_segments`) | Verified on two product 170 lamps |
+| Animations (`surplife_ble.set_animation`) | Verified on two product 170 lamps |
 | State confirmation | Verified on one DX23012 |
 | Multiple devices | Supported |
 | Automatic discovery | Supported |
@@ -60,7 +60,7 @@ Configure the integration through the UI:
 > **Tip:** If discovery does not find your device, use a BLE scanner app to find its address.
 > The device advertises as `IOTBT` followed by a short string. For example, `IOTBT144`.
 
-### Per-segment color (beta)
+### Per-segment color
 
 Lamps that support segments get two extra controls:
 
@@ -92,7 +92,7 @@ data:
 The integration asks the lamp for its segment count once and uses 20 if the lamp does not answer.
 Brightness changes keep the pattern. A single color or white replaces it.
 
-### Animations (beta)
+### Animations
 
 The **Effect** list also has the lamp's built-in animations, decoded from the Surplife app:
 Breathe, Alternate breath, Async breathe, Cycle, Sync gradient, Async gradient, Rainbow bridge,
