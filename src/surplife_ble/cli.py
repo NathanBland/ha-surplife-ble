@@ -130,6 +130,24 @@ def build_parser() -> argparse.ArgumentParser:
     _add_control_options(brightness)
     brightness.add_argument("--value", required=True, type=_percentage)
 
+    segments = subparsers.add_parser(
+        "segments", help="resolve the device, then give each segment its own colour"
+    )
+    _add_control_options(segments)
+    segments.add_argument(
+        "--rgb",
+        required=True,
+        nargs="+",
+        type=_rgb,
+        help="one R,G,B per segment; a shorter list is stretched across the lamp",
+    )
+    segments.add_argument("--brightness", type=_percentage, default=100)
+
+    profile = subparsers.add_parser(
+        "profile", help="resolve the device, then read its LED strip profile"
+    )
+    _add_control_options(profile)
+
     raw = subparsers.add_parser("raw-write", help="write reviewed bytes to one characteristic")
     _add_device(raw)
     raw.add_argument("--characteristic", required=True)
@@ -303,6 +321,12 @@ async def _control(args: argparse.Namespace) -> int:
             )
         elif args.command == "brightness":
             await client.set_brightness(max(1, args.value))
+        elif args.command == "segments":
+            await client.query_strip_profile()
+            await client.set_segments(args.rgb, brightness=max(1, args.brightness))
+        elif args.command == "profile":
+            profile = await client.query_strip_profile()
+            print(json.dumps(profile.to_dict() if profile else None, indent=2))
         print(json.dumps(client.state.to_dict() if client.state else {}, indent=2))
     return 0
 
@@ -765,7 +789,7 @@ async def _shell(args: argparse.Namespace) -> int:
                 else:
                     print(f"  unknown command: {cmd}. Type 'help' for available commands.")
             except Exception as err:
-                print(f"  error: {err}", file=sys.stderr)
+                print(f"  error: {err or type(err).__name__}", file=sys.stderr)
 
     print("Disconnected.")
     return 0
@@ -782,6 +806,8 @@ async def async_main(argv: list[str] | None = None) -> int:
         "color": _control,
         "white": _control,
         "brightness": _control,
+        "segments": _control,
+        "profile": _control,
         "raw-write": _raw_write,
         "replay": _replay,
         "hci-convert": _hci_convert,
@@ -799,7 +825,7 @@ def main() -> int:
     except KeyboardInterrupt:
         return 130
     except Exception as err:
-        print(f"error: {err}", file=sys.stderr)
+        print(f"error: {err or type(err).__name__}", file=sys.stderr)
         return 1
 
 

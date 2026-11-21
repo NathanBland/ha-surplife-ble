@@ -107,6 +107,7 @@ class ProtocolResolution:
     capabilities: set[str] = field(default_factory=set)
     source_packet_hex: str = ""
     notes: list[str] = field(default_factory=list)
+    product_id: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
@@ -126,6 +127,26 @@ class LightState:
     firmware_version: int | None = None
     led_count: int | None = None
     assumed: bool = False
+    raw_hex: str = ""
+    product_id: int | None = None
+    # Per-segment colours last sent by this integration. The lamp reports only
+    # one colour, so these are remembered rather than read back.
+    segments: tuple[tuple[int, int, int], ...] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class StripProfile:
+    """Addressable strip layout reported by ``get_symp_config_v2`` (63 12 21 F0)."""
+
+    point_count: int
+    segment_count: int
+    ic_type: int
+    color_order: int
+    music_segment_count: int
+    support_type: int
     raw_hex: str = ""
 
     def to_dict(self) -> dict[str, Any]:

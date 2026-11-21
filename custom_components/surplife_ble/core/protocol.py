@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import colorsys
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from .framing import candidate_payloads, checksum_valid, with_checksum, wrap_magichome
-from .models import LightState, ProtocolResolution
+from .models import LightState, ProtocolResolution, StripProfile
+from .products import is_symphony_e1_product
 
 QUERY_LED_BLE = bytes.fromhex("ef0177")
 QUERY_CLASSIC = bytes.fromhex("818a8b96")
@@ -47,6 +49,29 @@ IOTBT_CMD_E1_PREFIX = 0xE1
 IOTBT_CMD_E1_SEGMENT_OP = 0x03
 IOTBT_CMD_E1_SEGMENT_RECORD = 0xA1
 IOTBT_SEGMENT_COUNT = 20
+
+# BLE command ID (the wrapper's "family" byte) for the unified 3B/E0/E1 light
+# commands. The Surplife app's ble_dp_cmd.json gives bright_value_v2 opcode 11,
+# and IOTBT04F disconnects on 0x0A. See docs/protocol-apk-1.6.5.md section 3.
+IOTBT_COMMAND_FAMILY = 0x0B
+
+# get_symp_config_v2: asks a symphony device for its strip layout.
+SYMPHONY_CONFIG_QUERY = with_checksum(bytes.fromhex("631221f0"))
+SYMPHONY_CONFIG_RESPONSE_LENGTH = 11
+
+# LED chip names from the app's symphonyIC table (subset). Others show by index.
+SYMPHONY_IC_NAMES = {
+    1: "universal",
+    2: "SM16703P",
+    3: "WS2812E",
+    4: "UC1903B",
+    5: "universal RGBW",
+    6: "ASL14040",
+    7: "IC2811F",
+    8: "RGBW TM1814",
+    9: "universal RGBCW",
+    21: "WS2805 (RGBCW)",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +154,8 @@ def classify_packet(packet: bytes) -> tuple[ProtocolResolution, bytes, str] | No
                 notes.append(
                     "IOTBT EA 81 layout matches the verified DX23012 state signature."
                 )
+                if is_symphony_e1_product(layout_byte):
+                    capabilities.add("segments")
             else:
                 model_num = None
                 firmware = None
@@ -148,6 +175,7 @@ def classify_packet(packet: bytes) -> tuple[ProtocolResolution, bytes, str] | No
                     capabilities=capabilities,
                     source_packet_hex=candidate.hex(),
                     notes=notes,
+                    product_id=layout_byte,
                 ),
                 candidate,
                 framing,
@@ -229,6 +257,7 @@ def parse_state(packet: bytes) -> LightState | None:
                 firmware_version=None,
                 led_count=state[18] if len(state) > 18 else None,
                 raw_hex=state.hex(),
+                product_id=state[4],
             )
         hue = clamp(state[11], 0, 180) * 2 / 360
         saturation = clamp(state[12], 0, 100) / 100
@@ -401,10 +430,42 @@ def iotbt_3b_brightness(brightness: int) -> bytes:
     return with_checksum(payload)
 
 
-def iotbt_power(turn_on: bool) -> bytes:
-    """Build a power command for the IOTBT DX23012.
+def iotbt_power(
+    turn_on: bool,
+    *,
+    preview: int = 0,
+    delay: int = 0,
+    gradient: int = 0,
+) -> bytes:
+    """Build the app's ``switch_led_v3`` power command (no checksum).
 
-    Uses the same E0 zone-power format as the extended-custom codec.
+    Format: ``E0 01 {preview} 3B {open} 00 00 00 00 00 {gradient:3} {delay:2}``
+    from the Surplife 1.6.5 ``wifi_dp_cmd.json``. ``open`` is 0x23 for on and
+    0x24 for off, as everywhere else in the MagicHome protocol.
+    """
+    return bytes(
+        (
+            IOTBT_CMD_E0_PREFIX,
+            IOTBT_CMD_E0_ZONE,
+            clamp(preview, 0, 0xFF),
+            IOTBT_CMD_PREFIX,
+            POWER_ON if turn_on else POWER_OFF,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    ) + clamp(gradient, 0, 0xFFFFFF).to_bytes(3, "big") + clamp(delay, 0, 0xFFFF).to_bytes(
+        2, "big"
+    )
+
+
+def iotbt_zone_power(turn_on: bool) -> bytes:
+    """Build the older E0 zone-power command the integration sent before 0.2.
+
+    It lacks the ``3B`` byte of the app's ``switch_led_v3``. Kept as a fallback
+    for firmware that ignores the app form.
     """
     zone = POWER_ON if turn_on else POWER_OFF
     return bytes((IOTBT_CMD_E0_PREFIX, IOTBT_CMD_E0_ZONE, 0x00, zone, *([0] * 10)))
@@ -531,6 +592,11 @@ def iotbt_e1_segment_rgb(
     """
     if not 1 <= segment_count <= 255:
         raise ValueError("segment_count must be between 1 and 255")
+    return iotbt_e1_segments([(red, green, blue)] * segment_count, brightness)
+
+
+def _e1_record(rgb: Sequence[int], brightness: int) -> bytes:
+    red, green, blue = rgb
     h, s, _v = colorsys.rgb_to_hsv(
         clamp(red, 0, 255) / 255,
         clamp(green, 0, 255) / 255,
@@ -539,27 +605,81 @@ def iotbt_e1_segment_rgb(
     hue = round(h * 360) % 360
     saturation = clamp(round(s * 100), 0, 100)
     packed_hs = hue << 7 | saturation
-    level = clamp(brightness, 0, 100)
+    return bytes(
+        (
+            IOTBT_CMD_E1_SEGMENT_RECORD,
+            (packed_hs >> 8) & 0xFF,
+            packed_hs & 0xFF,
+            clamp(brightness, 0, 100),
+        )
+    )
+
+
+def iotbt_e1_segments(
+    colors: Sequence[Sequence[int]],
+    brightness: int | Sequence[int],
+) -> bytes:
+    """Build an E1 03 frame with one colour per segment.
+
+    ``colors`` lists an (r, g, b) tuple for each segment, in strip order.
+    ``brightness`` is one 0-100 percent for every segment, or one per segment.
+    The header repeats the record count as the app's capture does:
+    ``E1 03 00 N 00 00 N``.
+    """
+    count = len(colors)
+    if not 1 <= count <= 255:
+        raise ValueError("segment count must be between 1 and 255")
+    if isinstance(brightness, int):
+        levels: Sequence[int] = [brightness] * count
+    else:
+        levels = brightness
+        if len(levels) != count:
+            raise ValueError("brightness list must have one value per segment")
+    for rgb in colors:
+        if len(rgb) != 3:
+            raise ValueError("each segment colour must be an (r, g, b) triple")
     header = bytes(
         (
             IOTBT_CMD_E1_PREFIX,
             IOTBT_CMD_E1_SEGMENT_OP,
             0x00,
-            segment_count & 0xFF,
+            count,
             0x00,
             0x00,
-            segment_count & 0xFF,
+            count,
         )
     )
-    record = bytes(
-        (
-            IOTBT_CMD_E1_SEGMENT_RECORD,
-            (packed_hs >> 8) & 0xFF,
-            packed_hs & 0xFF,
-            level,
-        )
+    return header + b"".join(
+        _e1_record(rgb, level) for rgb, level in zip(colors, levels, strict=True)
     )
-    return header + record * segment_count
+
+
+def parse_symphony_config(packet: bytes) -> StripProfile | None:
+    """Parse a ``get_symp_config_v2`` response.
+
+    Layout from the app's ``wifi_dp_response.json``:
+    ``{supportType} 63 {pointCount:2} {part:2} {icType} {sort} {musicPart:2} {cs}``.
+    """
+    for candidate, _framing in candidate_payloads(packet):
+        if len(candidate) < SYMPHONY_CONFIG_RESPONSE_LENGTH or candidate[1] != 0x63:
+            continue
+        body = candidate[:SYMPHONY_CONFIG_RESPONSE_LENGTH]
+        if not checksum_valid(body):
+            continue
+        point_count = int.from_bytes(body[2:4], "big")
+        segment_count = int.from_bytes(body[4:6], "big")
+        if not 1 <= segment_count <= 255 or point_count < segment_count:
+            continue
+        return StripProfile(
+            point_count=point_count,
+            segment_count=segment_count,
+            ic_type=body[6],
+            color_order=body[7],
+            music_segment_count=int.from_bytes(body[8:10], "big"),
+            support_type=body[0],
+            raw_hex=body.hex(),
+        )
+    return None
 
 
 def extended_e0_white(brightness: int) -> bytes:

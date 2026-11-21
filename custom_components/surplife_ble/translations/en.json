@@ -26,5 +26,21 @@
         }
       }
     }
+  },
+  "services": {
+    "set_segments": {
+      "name": "Set segment colors",
+      "description": "Give each segment of the lamp its own color. A shorter list is stretched evenly across the segments, so two colors split the lamp in half.",
+      "fields": {
+        "colors": {
+          "name": "Colors",
+          "description": "List of [red, green, blue] colors, from the first segment to the last."
+        },
+        "brightness": {
+          "name": "Brightness",
+          "description": "Brightness from 1 to 255. Defaults to the current brightness."
+        }
+      }
+    }
   }
 }

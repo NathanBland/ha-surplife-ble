@@ -94,6 +94,7 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
         self._confirmation_generation = 0
         self._consecutive_failures = 0
         self._probe_failures = 0
+        self._strip_profile_attempted = False
         self._next_probe_at: float | None = None
         self._connect_failed_at: float | None = None
 
@@ -275,7 +276,26 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
             raise UpdateFailed("device did not return a supported state frame")
         if not client.resolution or not client.resolution.repeatable:
             raise UpdateFailed("device state response could not be repeated")
+        await self._async_fetch_strip_profile(client)
         return state
+
+    async def _async_fetch_strip_profile(self, client: LightClient) -> None:
+        """Ask a symphony lamp once for its segment count; it is optional."""
+        if (
+            self._strip_profile_attempted
+            or client.resolution is None
+            or client.resolution.codec != "iotbt-ea81"
+            or client.strip_profile is not None
+        ):
+            return
+        self._strip_profile_attempted = True
+        try:
+            profile = await client.query_strip_profile()
+        except (BleakError, RuntimeError, TimeoutError) as err:
+            _LOGGER.debug("Strip profile query for %s failed: %s", self.address, err)
+            return
+        if profile is not None:
+            _LOGGER.debug("Surplife BLE device %s strip profile: %s", self.address, profile)
 
     async def _async_update_data(self) -> LightState:
         async with self._operation_lock:
@@ -359,6 +379,16 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
             self._record_success()
             self.async_set_updated_data(self.client.state)
             return self.client.state
+
+    async def async_set_segments(
+        self, colors: list[tuple[int, int, int]], brightness: int | None
+    ) -> None:
+        if brightness is None:
+            brightness = self.data.brightness if self.data and self.data.brightness else 255
+        await self._async_command(
+            "set_segments", colors, brightness=max(1, round(brightness / 255 * 100))
+        )
+        self._clear_assumed_rgb()
 
     async def async_set_power(self, turn_on: bool) -> None:
         await self._async_command("set_power", turn_on)

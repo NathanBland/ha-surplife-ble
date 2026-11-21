@@ -14,6 +14,7 @@ It supports the MIHEAL DX23012 floor lamp and similar devices that use the IOTBT
 | RGB color | Verified on one DX23012 |
 | White brightness | Needs hardware retest |
 | Overall brightness | Verified on one DX23012 |
+| Per-segment color (`surplife_ble.set_segments`) | Beta, needs hardware test |
 | State confirmation | Verified on one DX23012 |
 | Multiple devices | Supported |
 | Automatic discovery | Supported |
@@ -57,6 +58,25 @@ Configure the integration through the UI:
 
 > **Tip:** If discovery does not find your device, use a BLE scanner app to find its address.
 > The device advertises as `IOTBT` followed by a short string. For example, `IOTBT144`.
+
+### Per-segment color (beta)
+
+The `surplife_ble.set_segments` action gives each segment of the lamp its own color.
+A shorter list is spread evenly, so two colors split the lamp in half.
+
+```yaml
+action: surplife_ble.set_segments
+target:
+  entity_id: light.floor_lamp
+data:
+  colors:
+    - [255, 0, 0]
+    - [0, 0, 255]
+  brightness: 200
+```
+
+The integration asks the lamp for its segment count once and uses 20 if the lamp does not answer.
+Brightness changes keep the pattern. A single color or white replaces it.
 
 ## Known limitations
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
 from typing import Any, Protocol
 
@@ -13,17 +13,21 @@ from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 
 from .capture import JsonlCapture
-from .framing import NotificationReassembler, SequenceCounter
+from .framing import NotificationReassembler, SequenceCounter, segment_magichome
 from .models import (
     GattCharacteristic,
     GattProfile,
     GattService,
     LightState,
     ProtocolResolution,
+    StripProfile,
     TrafficRecord,
     rgb_state_matches,
 )
 from .protocol import (
+    IOTBT_COMMAND_FAMILY,
+    IOTBT_SEGMENT_COUNT,
+    SYMPHONY_CONFIG_QUERY,
     ProbeFrame,
     byte_to_percent,
     classic_power,
@@ -37,13 +41,25 @@ from .protocol import (
     frame_for_transport,
     iotbt_3b_white,
     iotbt_e1_segment_rgb,
+    iotbt_e1_segments,
     iotbt_power,
+    iotbt_zone_power,
     original_power,
     parse_state,
+    parse_symphony_config,
     probe_frames,
 )
 
 ClientFactory = Callable[[BLEDevice], Any | Awaitable[Any]]
+
+# ATT header bytes subtracted from the negotiated MTU to get a write's payload.
+_ATT_HEADER_LENGTH = 3
+# The default ATT MTU. A client reporting this (or nothing) has not told us the
+# negotiated value, so long commands are sent as one write, as before.
+_DEFAULT_ATT_MTU = 23
+# Power command forms for IOTBT lamps, tried in order until one is confirmed.
+POWER_FORM_APP = "switch_led_v3"
+POWER_FORM_ZONE = "zone"
 
 
 class BleakClientLike(Protocol):
@@ -94,6 +110,11 @@ class LightClient:
         self._probe_frame: ProbeFrame | None = None
         self.resolution: ProtocolResolution | None = None
         self.state: LightState | None = None
+        self.strip_profile: StripProfile | None = None
+        # The IOTBT power form confirmed to work on this lamp, once known.
+        self._power_form: str | None = None
+        # Per-segment colours last sent, kept across state refreshes.
+        self._segments: tuple[tuple[int, int, int], ...] | None = None
 
     @property
     def connected(self) -> bool:
@@ -264,14 +285,19 @@ class LightClient:
         characteristic: GattCharacteristic | None = None,
         framing: str | None = None,
         note: str | None = None,
+        prefer_response: bool = False,
     ) -> None:
         client = self._require_client()
         target = characteristic or self._write_characteristic
         if target is None:
             raise RuntimeError("device exposes no writable GATT characteristic")
-        response = (
-            "write-without-response" not in target.properties and "write" in target.properties
-        )
+        if prefer_response and "write" in target.properties:
+            response = True
+        else:
+            response = (
+                "write-without-response" not in target.properties
+                and "write" in target.properties
+            )
         await client.write_gatt_char(target.uuid, payload, response=response)
         self.capture.write(
             TrafficRecord(
@@ -294,18 +320,43 @@ class LightClient:
         command_family: int = 0x0A,
     ) -> None:
         await self._start_notifications()
-        framed = frame_for_transport(
-            payload,
-            transport,
-            self._sequence.next(),
-            command_family=command_family,
-        )
-        await self._write(
-            framed,
-            characteristic=characteristic,
-            framing=transport,
-            note=note,
-        )
+        sequence = self._sequence.next()
+        max_frame = self._max_frame_length()
+        if transport == "magichome2" and max_frame is not None:
+            frames = segment_magichome(
+                payload,
+                sequence,
+                command_family=command_family,
+                max_frame_length=max_frame,
+            )
+        else:
+            frames = [
+                frame_for_transport(
+                    payload,
+                    transport,
+                    sequence,
+                    command_family=command_family,
+                )
+            ]
+        segmented = len(frames) > 1
+        for index, framed in enumerate(frames):
+            await self._write(
+                framed,
+                characteristic=characteristic,
+                framing=transport if not segmented else f"{transport}:segment-{index}",
+                note=note,
+                # Like the app, wait for each segment to be acknowledged at the
+                # GATT level before sending the next one.
+                prefer_response=segmented,
+            )
+
+    def _max_frame_length(self) -> int | None:
+        """Largest single write, or None when the negotiated MTU is unknown."""
+        mtu = getattr(self._client, "mtu_size", None)
+        if not isinstance(mtu, int) or mtu <= _DEFAULT_ATT_MTU:
+            return None
+        # The app caps v0 frames at 255 bytes.
+        return min(mtu - _ATT_HEADER_LENGTH, 255)
 
     async def _read_candidates(self) -> list[tuple[str, bytes]]:
         client = self._require_client()
@@ -523,7 +574,8 @@ class LightClient:
         elif resolution.codec == "original-ledenet":
             await self._send_inner(original_power(turn_on), probe.transport, note="power")
         elif resolution.codec == "iotbt-ea81":
-            await self._send_inner(iotbt_power(turn_on), probe.transport, note="power")
+            await self._set_iotbt_power(turn_on, probe)
+            return
         elif turn_on:
             brightness = (
                 byte_to_percent(self.state.brightness)
@@ -541,6 +593,135 @@ class LightClient:
             self.state = LightState()
         self.state.power = turn_on
         self.state.assumed = True
+
+    async def _set_iotbt_power(self, turn_on: bool, probe: ProbeFrame) -> None:
+        """Send the app's switch_led_v3 power, falling back to the legacy form.
+
+        The confirmed form is cached so later toggles cost one write.
+        """
+        if self._power_form == POWER_FORM_ZONE:
+            await self._send_inner(iotbt_zone_power(turn_on), probe.transport, note="power")
+            self._mark_power(turn_on)
+            return
+        await self._send_inner(
+            iotbt_power(turn_on),
+            probe.transport,
+            note="power switch_led_v3",
+            command_family=IOTBT_COMMAND_FAMILY,
+        )
+        if self._power_form == POWER_FORM_APP:
+            self._mark_power(turn_on)
+            return
+        await asyncio.sleep(0.15)
+        confirmed = await self.query_state(response_timeout=0.75, allow_reads=False)
+        if confirmed is not None and confirmed.power is turn_on:
+            self._power_form = POWER_FORM_APP
+            return
+        await self._send_inner(iotbt_zone_power(turn_on), probe.transport, note="power zone")
+        await asyncio.sleep(0.15)
+        confirmed = await self.query_state(response_timeout=0.75, allow_reads=False)
+        if confirmed is not None and confirmed.power is turn_on:
+            self._power_form = POWER_FORM_ZONE
+            return
+        self._mark_power(turn_on)
+
+    def _mark_power(self, turn_on: bool) -> None:
+        if self.state is None:
+            self.state = LightState()
+        self.state.power = turn_on
+        self.state.assumed = True
+
+    @property
+    def segment_count(self) -> int:
+        """Segments to address: the queried strip profile, else the lamp default."""
+        if self.strip_profile is not None:
+            return self.strip_profile.segment_count
+        return IOTBT_SEGMENT_COUNT
+
+    @property
+    def segments(self) -> tuple[tuple[int, int, int], ...] | None:
+        """Per-segment colours last sent, or None after a uniform colour."""
+        return self._segments
+
+    async def query_strip_profile(self, *, response_timeout: float = 1.0) -> StripProfile | None:
+        """Ask the lamp for its LED strip configuration (get_symp_config_v2)."""
+        resolution, probe = self._require_control_resolution()
+        if resolution.codec != "iotbt-ea81":
+            return None
+        loop = asyncio.get_running_loop()
+        for family in (0x0A, IOTBT_COMMAND_FAMILY):
+            self._flush_notifications()
+            await self._send_inner(
+                SYMPHONY_CONFIG_QUERY,
+                probe.transport,
+                note="strip profile query",
+                command_family=family,
+            )
+            deadline = loop.time() + response_timeout
+            while (remaining := deadline - loop.time()) > 0:
+                try:
+                    _characteristic, packet = await asyncio.wait_for(
+                        self._notifications.get(), timeout=remaining
+                    )
+                except TimeoutError:
+                    break
+                profile = parse_symphony_config(packet)
+                if profile is not None:
+                    self.strip_profile = profile
+                    return profile
+        return None
+
+    async def set_segments(
+        self,
+        colors: Sequence[tuple[int, int, int]],
+        *,
+        brightness: int = 100,
+    ) -> None:
+        """Paint each lamp segment its own colour with one E1 03 command.
+
+        A shorter colour list is stretched evenly across the segments, so two
+        colours give a half-and-half split.
+        """
+        resolution, probe = self._require_control_resolution()
+        if resolution.codec != "iotbt-ea81":
+            raise RuntimeError("per-segment colour needs an IOTBT symphony lamp")
+        if not colors:
+            raise ValueError("at least one colour is required")
+        brightness = max(1, min(100, brightness))
+        count = self.segment_count
+        if len(colors) > count:
+            raise ValueError(f"this lamp has {count} segments; got {len(colors)} colours")
+        stretched = tuple(
+            tuple(max(0, min(255, int(c))) for c in colors[i * len(colors) // count])
+            for i in range(count)
+        )
+        self._flush_notifications()
+        await self._send_inner(
+            iotbt_e1_segments(stretched, brightness),
+            probe.transport,
+            note="set segments e1 03",
+            command_family=IOTBT_COMMAND_FAMILY,
+        )
+        self._segments = stretched  # type: ignore[assignment]
+        self.state = LightState(
+            power=True,
+            rgb=stretched[0],  # type: ignore[arg-type]
+            brightness=round(brightness * 255 / 100),
+            white=0,
+            model_num=resolution.model_num,
+            firmware_version=resolution.firmware_version,
+            product_id=resolution.product_id,
+            segments=self._segments,
+            assumed=True,
+        )
+        # The lamp needs a state round trip before it accepts the next long
+        # segment write.
+        optimistic = self.state
+        confirmed = await self.query_state(response_timeout=0.75, allow_reads=False)
+        if confirmed is not None:
+            confirmed.segments = self._segments
+            if confirmed.power is not True:
+                self.state = optimistic
 
     async def set_rgb(
         self,
@@ -563,14 +744,17 @@ class LightClient:
             )
             await self._send_inner(payload, probe.transport, note="set rgb")
         elif resolution.codec == "iotbt-ea81":
-            payload = iotbt_e1_segment_rgb(red, green, blue, brightness)
+            payload = iotbt_e1_segment_rgb(
+                red, green, blue, brightness, segment_count=self.segment_count
+            )
             expected_brightness = round(brightness * 255 / 100)
+            self._segments = None
             self._flush_notifications()
             await self._send_inner(
                 payload,
                 probe.transport,
                 note="set rgb e1 03",
-                command_family=0x0B,
+                command_family=IOTBT_COMMAND_FAMILY,
             )
             self.state = LightState(
                 power=True,
@@ -652,7 +836,13 @@ class LightClient:
             await self._send_inner(payload, probe.transport, note="set white")
         elif resolution.codec == "iotbt-ea81":
             payload = iotbt_3b_white(brightness)
-            await self._send_inner(payload, probe.transport, note="set white")
+            self._segments = None
+            await self._send_inner(
+                payload,
+                probe.transport,
+                note="set white",
+                command_family=IOTBT_COMMAND_FAMILY,
+            )
         elif experimental_e122:
             if "candidate-e122" not in resolution.capabilities:
                 raise RuntimeError("E1 22 is only enabled for a matching extended candidate")
@@ -679,6 +869,8 @@ class LightClient:
             # brightness, which is what the official app does.
             if self.state and self.state.white:
                 await self.set_white(brightness)
+            elif self._segments is not None:
+                await self.set_segments(self._segments, brightness=brightness)
             else:
                 rgb = self.state.rgb if self.state and self.state.rgb else (255, 255, 255)
                 await self.set_rgb(*rgb, brightness=brightness)

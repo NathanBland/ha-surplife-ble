@@ -19,6 +19,7 @@ from custom_components.surplife_ble.core.protocol import (
     iotbt_e0_white,
     iotbt_e1_segment_rgb,
     iotbt_power,
+    iotbt_zone_power,
     parse_state,
     probe_frames,
 )
@@ -228,16 +229,20 @@ def test_iotbt_e0_rgb_differs_from_extended() -> None:
     assert iotbt_cmd[4] == 120
 
 
-def test_iotbt_power_on_command() -> None:
-    cmd = iotbt_power(True)
-    assert cmd[0] == 0xE0
-    assert cmd[3] == 0x23  # POWER_ON
+def test_iotbt_power_matches_app_switch_led_v3() -> None:
+    # e0 01 {preview} 3b {open} 00x5 {gradient:3} {delay:2}
+    assert iotbt_power(True) == bytes.fromhex("e001003b2300000000000000000000")
+    assert iotbt_power(False) == bytes.fromhex("e001003b2400000000000000000000")
 
 
-def test_iotbt_power_off_command() -> None:
-    cmd = iotbt_power(False)
-    assert cmd[0] == 0xE0
-    assert cmd[3] == 0x24  # POWER_OFF
+def test_iotbt_power_encodes_preview_gradient_and_delay() -> None:
+    cmd = iotbt_power(True, preview=1, gradient=0x010203, delay=0x0405)
+    assert cmd == bytes.fromhex("e001013b2300000000000102030405")
+
+
+def test_iotbt_zone_power_keeps_legacy_form() -> None:
+    assert iotbt_zone_power(True) == bytes.fromhex("e0010023" + "00" * 10)
+    assert iotbt_zone_power(False) == bytes.fromhex("e0010024" + "00" * 10)
 
 
 def test_iotbt_e0_white_uses_white_rgb() -> None:

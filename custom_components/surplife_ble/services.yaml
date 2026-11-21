@@ -1,0 +1,17 @@
+set_segments:
+  target:
+    entity:
+      integration: surplife_ble
+      domain: light
+  fields:
+    colors:
+      required: true
+      example: "[[255, 0, 0], [0, 0, 255]]"
+      selector:
+        object:
+    brightness:
+      required: false
+      selector:
+        number:
+          min: 1
+          max: 255

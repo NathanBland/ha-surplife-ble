@@ -35,7 +35,14 @@ async def async_get_config_entry_diagnostics(
             "led_count": state.led_count if state else None,
             "model_num": state.model_num if state else None,
             "firmware_version": state.firmware_version if state else None,
+            "product_id": state.product_id if state else None,
         },
+        "strip_profile": coordinator.client.strip_profile.to_dict()
+        if coordinator.client and coordinator.client.strip_profile
+        else None,
+        "segment_colors": [list(rgb) for rgb in coordinator.client.segments]
+        if coordinator.client and coordinator.client.segments
+        else None,
         "resolution": {
             "codec": coordinator.client.resolution.codec
             if coordinator.client and coordinator.client.resolution

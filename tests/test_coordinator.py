@@ -176,7 +176,7 @@ async def test_command_does_not_retry_programming_errors(
 
     class FakeClient:
         resolved = True
-        resolution = SimpleNamespace(repeatable=True)
+        resolution = SimpleNamespace(repeatable=True, codec="classic-8byte")
         state = LightState()
 
         async def set_rgb(self) -> None:
@@ -200,7 +200,7 @@ class PollingFakeClient:
 
     def __init__(self) -> None:
         self.resolved = True
-        self.resolution = SimpleNamespace(repeatable=True)
+        self.resolution = SimpleNamespace(repeatable=True, codec="classic-8byte")
         self.state = LightState(power=True, brightness=100)
         self.error: Exception | None = None
         self.queries = 0
@@ -319,7 +319,7 @@ class UnreachableFakeClient:
     def __init__(self) -> None:
         self.connected = False
         self.resolved = True
-        self.resolution = SimpleNamespace(repeatable=True)
+        self.resolution = SimpleNamespace(repeatable=True, codec="classic-8byte")
         self.state = LightState(power=True)
         self.connects = 0
         # Number of connection attempts that hang before one succeeds.

@@ -31,3 +31,13 @@ def test_translations_match_strings() -> None:
     strings = json.loads((INTEGRATION / "strings.json").read_text(encoding="utf-8"))
     english = json.loads((INTEGRATION / "translations" / "en.json").read_text(encoding="utf-8"))
     assert english == strings
+
+
+def test_services_yaml_matches_service_strings() -> None:
+    services_yaml = (INTEGRATION / "services.yaml").read_text(encoding="utf-8")
+    strings = json.loads((INTEGRATION / "strings.json").read_text(encoding="utf-8"))
+    services = strings["services"]
+    for name, service in services.items():
+        assert f"\n{name}:" in f"\n{services_yaml}"
+        for field in service["fields"]:
+            assert f"    {field}:" in services_yaml

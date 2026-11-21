@@ -8,6 +8,18 @@ from dataclasses import dataclass
 MAGIC_MARKER = b"\x80\x00"
 FLUX_WRAPPER = b"\xb0\xb1\xb2\xb3"
 
+# MagicHome2 BLE transport control byte, from the Surplife 1.6.5 APK
+# (com.zengge.hagallbjarkan.protocol.zgble.LowerTransportLayerEncoder/Decoder).
+CTRL_SEGMENTED = 0x40
+CTRL_PROTECT = 0x20
+CTRL_ACK_REQUESTED = 0x10
+CTRL_TYPE_MASK = 0x0C
+CTRL_TYPE_ACK = 0x08
+CTRL_VERSION_MASK = 0x03
+FRAME_HEADER_LENGTH = 8
+CONTINUATION_HEADER_LENGTH = 5
+LAST_SEGMENT_FLAG = 0x8000
+
 
 def additive_checksum(payload: bytes | bytearray) -> int:
     """Return the low byte of the additive LEDENET checksum."""
@@ -60,6 +72,66 @@ def wrap_magichome(
     return bytes((0, sequence)) + MAGIC_MARKER + declared_length.to_bytes(2, "big") + bytes(
         (len(payload) + 1, command_family)
     ) + payload
+
+
+def segment_magichome(
+    payload: bytes,
+    sequence: int,
+    *,
+    command_family: int,
+    max_frame_length: int,
+) -> list[bytes]:
+    """Split a command into MagicHome2 v0 frames no longer than ``max_frame_length``.
+
+    A command that fits is one ordinary frame from ``wrap_magichome``. A longer
+    one follows the app's segmented layout:
+
+    - first frame: ``40 seq 00 00 <total len BE16> <chunk len + 1> <family>``
+      followed by ``max_frame_length - 8`` payload bytes
+    - each later frame: ``40 seq <index BE16> <chunk len>`` followed by up to
+      ``max_frame_length - 5`` payload bytes; the last index has bit 15 set.
+    """
+    if len(payload) + FRAME_HEADER_LENGTH <= max_frame_length:
+        return [wrap_magichome(payload, sequence, command_family=command_family)]
+    if max_frame_length <= FRAME_HEADER_LENGTH:
+        raise ValueError("max_frame_length is too small to carry any payload")
+    if not 0 <= sequence <= 0xFF:
+        raise ValueError("sequence must be between 0 and 255")
+    if len(payload) > 0xFFFF:
+        raise ValueError("framed payload is too long")
+    first_chunk = max_frame_length - FRAME_HEADER_LENGTH
+    frames = [
+        bytes((CTRL_SEGMENTED, sequence, 0x00, 0x00))
+        + len(payload).to_bytes(2, "big")
+        + bytes((first_chunk + 1, command_family))
+        + payload[:first_chunk]
+    ]
+    chunk_size = max_frame_length - CONTINUATION_HEADER_LENGTH
+    offset = first_chunk
+    index = 1
+    while offset < len(payload):
+        chunk = payload[offset : offset + chunk_size]
+        offset += len(chunk)
+        marker = index | (LAST_SEGMENT_FLAG if offset >= len(payload) else 0)
+        if index > 0x7FFF:
+            raise ValueError("framed payload needs too many segments")
+        frames.append(
+            bytes((CTRL_SEGMENTED, sequence))
+            + marker.to_bytes(2, "big")
+            + bytes((len(chunk),))
+            + chunk
+        )
+        index += 1
+    return frames
+
+
+def is_ack_frame(frame: bytes) -> bool:
+    """True for a transport-level ack packet, which carries no command data."""
+    return (
+        len(frame) >= 7
+        and frame[2:4] == MAGIC_MARKER
+        and frame[0] & CTRL_TYPE_MASK == CTRL_TYPE_ACK
+    )
 
 
 def unwrap_magichome(frame: bytes) -> tuple[bytes, str] | None:
@@ -125,14 +197,52 @@ class NotificationReassembler:
 
     def __init__(self) -> None:
         self._buffer = bytearray()
+        # (sequence, declared total length, next expected index, data so far)
+        self._segment: tuple[int, int, int, bytearray] | None = None
 
     def reset(self) -> None:
         self._buffer.clear()
+        self._segment = None
+
+    def _feed_segment(self, chunk: bytes) -> list[bytes] | None:
+        """Handle a segmented transport frame, or return None when it is not one."""
+        if not self._buffer and len(chunk) >= FRAME_HEADER_LENGTH and (
+            chunk[0] & 0xC0 == CTRL_SEGMENTED and chunk[2:4] == b"\x00\x00"
+        ):
+            total = int.from_bytes(chunk[4:6], "big")
+            data = bytearray(chunk[FRAME_HEADER_LENGTH : FRAME_HEADER_LENGTH + chunk[6] - 1])
+            self._segment = (chunk[1], total, 1, data)
+            return []
+        segment = self._segment
+        if (
+            segment is None
+            or len(chunk) < CONTINUATION_HEADER_LENGTH
+            or chunk[0] & 0xC0 != CTRL_SEGMENTED
+            or chunk[1] != segment[0]
+        ):
+            return None
+        sequence, total, expected, data = segment
+        marker = int.from_bytes(chunk[2:4], "big")
+        if marker & 0x7FFF != expected:
+            # A lost or reordered segment makes the whole command unusable.
+            self._segment = None
+            return []
+        data.extend(chunk[CONTINUATION_HEADER_LENGTH : CONTINUATION_HEADER_LENGTH + chunk[4]])
+        if not marker & LAST_SEGMENT_FLAG:
+            self._segment = (sequence, total, expected + 1, data)
+            return []
+        self._segment = None
+        return [bytes(data[:total])] if len(data) >= total else []
 
     def feed(self, chunk: bytes) -> list[bytes]:
         """Append one notification and return any complete recognizable packets."""
         if not chunk:
             return []
+        if not self._buffer and is_ack_frame(chunk):
+            return []
+        segmented = self._feed_segment(chunk)
+        if segmented is not None:
+            return segmented
         if not self._buffer:
             self._buffer.extend(chunk)
         else:
