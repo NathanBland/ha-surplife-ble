@@ -274,3 +274,50 @@ Phases 1–6 and tier A are implemented. All are covered by unit tests; none is 
 | Product table | `core/products.py` | 62 products. Tier A = 57, 69, 76, 83, 86, 170, 171, 175, 181, 183, 184, 186, 187, 188. 182 is excluded because the flux_led reference maps it to extended-custom. Classification still requires the verified EA 81 layout (`byte 5 == 0x09`), so tier A only adds naming and the `segments` capability. |
 
 Hardware checks still open: whether 0x0B power and white are accepted, whether the lamp answers the profile query (and on which cmdId), and whether segmented TX works at the lamp's real MTU.
+
+## 10. Symphony animations (recovered from Dart AOT with Jadart, 2026-11-20)
+
+Source: `libapp.so` lifted with Jadart (commit 3707ae9, `MAX_INSNS` raised to 20000).
+Dart Smi literals print tagged, so every number below has been halved. Treat the
+halving as Likely; it gives wave = 1, speed 50 and brightness 80, which all look right.
+
+### 10.1 Custom animation command (Confirmed, `buildSymphonyCustomHEXCommand`)
+
+    E1 01 00 {brightness} {model} {modelExpand} {direction} {density} {speed} 00
+             {background colour record} {fg count} {fg colour records...}
+
+- Colour record: `A1 {hs hi} {hs lo} {value}` with `hs = (h & 0x1ff) << 7 | (s & 0x7f)` for RGB,
+  or `B1 ...` for white. This is the same record as in E1 03 segment writes.
+- App defaults: brightness 80, speed 50, density 25 (40 for newer modes), effectLength 30,
+  direction right. `otherModeValue` is probably `modelExpand` (1 for flash/firefly/star modes).
+
+### 10.2 Controller and dynamic commands (Confirmed layout, use unverified)
+
+    E5 01 00 {brightness} {model} {direction} {speed} 00 {colorCount} {h s v}...
+    E5 02 00 {p0} {p1} {p2} {p3} {n_hi} {n_lo} {h s v}...
+
+### 10.3 Model values (`getSymphonyCustomModeList`)
+
+| Model | Effect | Model | Effect |
+|---|---|---|---|
+| 1 | Wave | 17 | Comet |
+| 2 | Meteor | 18 | Gradient meteor |
+| 3 | Streamer | 19 | Volcano |
+| 4 | Building blocks | 20 | Faster light |
+| 5 | Running water | 21 | Rainbow bridge |
+| 6 | Chase | 22 | Gradient overlay |
+| 7 | Horse racing | 23, 24 | Lightning shine |
+| 8 | Cycles | 48 | Chase twinkle / Helix* |
+| 9 | **Breathe** | 49 | Chase melting / Double helix* |
+| 10 | Jump | 50 | Chase lightning |
+| 11 | Sharp flash (expand 1) | 60–63 | Melting twinkle, twinkle shine, lightning melting, lightning shine |
+| 12 | Twinkling stars / Firefly (expand 1) | 64–68 | Lightning, melting, twinkling stars, sparkles, galaxy |
+| 13 | Stars wink (expand 1) | 69 | **Alternate breath** |
+| 14 | Warning | 71–74 | Background star wink, sparkle marquee, periodic meteors, multi accumulation |
+| 15 | Collision | 75 | **Async breathe** |
+| 16 | Fireworks | 76, 77 | **Async gradient**, **sync gradient** (colour cycles) |
+| 101 | Static gradient | 102 | Static fill |
+
+\* The function builds separate lists per product family, so values 48/49 mean different
+things in different lists. Which list product 170 gets is not confirmed yet. Models 1–22
+and 101/102 appear in every list.
