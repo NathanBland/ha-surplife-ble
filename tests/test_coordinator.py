@@ -464,6 +464,8 @@ async def test_segment_colors_follow_solid_colour_and_white_mode(
         monkeypatch, LightState(power=True, rgb=(255, 0, 0), brightness=255, white=0)
     )
     assert coordinator.segment_colors() == [(255, 0, 0)] * 4
+    coordinator.data = LightState(power=True, rgb=(0, 60, 120), brightness=120, white=0)
+    assert coordinator.segment_colors() == [(0, 128, 255)] * 4
     coordinator.data = LightState(power=True, rgb=(255, 0, 0), brightness=255, white=200)
     assert coordinator.segment_colors() is None
     coordinator.data = LightState(power=False, rgb=(255, 0, 0), brightness=255, white=0)

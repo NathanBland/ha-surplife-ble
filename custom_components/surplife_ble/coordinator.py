@@ -412,9 +412,13 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
         segments = self.client.segments if self.client is not None else None
         if segments is not None:
             return [tuple(rgb) for rgb in segments]  # type: ignore[misc]
-        if state.rgb is None:
+        if state.rgb is None or max(state.rgb) == 0:
             return None
-        return [tuple(state.rgb)] * self.segment_count  # type: ignore[list-item]
+        # The reported colour is already dimmed by the lamp brightness; segments
+        # carry the full colour and the lamp brightness applies on top.
+        peak = max(state.rgb)
+        full = tuple(round(part * 255 / peak) for part in state.rgb)
+        return [full] * self.segment_count  # type: ignore[list-item]
 
     async def async_set_preset(self, name: str, brightness: int | None = None) -> None:
         await self.async_set_segments(preset_colors(name, self.segment_count), brightness)

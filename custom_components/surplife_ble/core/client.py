@@ -622,8 +622,14 @@ class LightClient:
                     note="power switch_led_v3",
                     command_family=IOTBT_COMMAND_FAMILY,
                 )
-            await asyncio.sleep(0.15)
-            confirmed = await self.query_state(response_timeout=0.75, allow_reads=False)
+            confirmed = None
+            # The first reply after a colour write can be stale; ask twice
+            # before treating the command as dropped.
+            for delay in (0.15, 0.3):
+                await asyncio.sleep(delay)
+                confirmed = await self.query_state(response_timeout=0.75, allow_reads=False)
+                if confirmed is not None and confirmed.power is turn_on:
+                    break
             if confirmed is not None and confirmed.power is turn_on:
                 if prior is not None and prior is not turn_on:
                     self._power_form = form

@@ -157,16 +157,21 @@ class FakeLamp(FakeIotbtBleakClient):
     """IOTBT lamp that answers the profile query and applies power commands."""
 
     def __init__(
-        self, *, mtu: int | None = None, accepts_app_power: bool = True, drop_power: int = 0
+        self, *, mtu: int | None = None, accepts_app_power: bool = True, drop_power: int = 0,
+        stale_replies: int = 0,
     ) -> None:
         super().__init__()
         if mtu is not None:
             self.mtu_size = mtu
         self.accepts_app_power = accepts_app_power
         self.drop_power = drop_power
+        self.stale_replies = stale_replies
+        self._pending_state: bytes | None = None
         self._reassembler = NotificationReassembler()
 
     async def write_gatt_char(self, uuid: str, data: bytes, response: bool | None = None) -> None:
+        if bytes(data).endswith(bytes.fromhex("ea818a8b")):
+            await self._answer_query()
         await super().write_gatt_char(uuid, data, response)
         data = bytes(data)
         if data.endswith(SYMPHONY_CONFIG_QUERY):
@@ -184,7 +189,18 @@ class FakeLamp(FakeIotbtBleakClient):
     def _set_power(self, value: int) -> None:
         state = bytearray(self.state)
         state[6] = value
+        if self.stale_replies > 0:
+            # Answer the next query(s) with the old state, then switch.
+            self._pending_state = bytes(state)
+            return
         self.state = bytes(state)
+
+    async def _answer_query(self) -> None:
+        if self._pending_state is not None:
+            if self.stale_replies > 0:
+                self.stale_replies -= 1
+                return
+            self.state, self._pending_state = self._pending_state, None
 
 
 def _client(fake: Any) -> LightClient:
@@ -220,6 +236,18 @@ async def test_power_falls_back_to_zone_form_when_ignored() -> None:
         assert len(_power_writes(fake)) == before + 1
         assert client.state is not None and client.state.power is True
         assert client.state.assumed is False
+
+
+@pytest.mark.asyncio
+async def test_power_rechecks_a_stale_reply_before_resending() -> None:
+    fake = FakeLamp(stale_replies=1)
+    client = _client(fake)
+    async with client:
+        await client.probe(allow_writes=True, response_timeout=0.5)
+        await client.set_power(False)
+        assert len(_power_writes(fake)) == 1
+        assert client.state is not None and client.state.power is False
+        assert client._power_form == POWER_FORM_APP
 
 
 def _power_writes(fake: FakeLamp) -> list[bytes]:
