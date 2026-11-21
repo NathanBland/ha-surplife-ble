@@ -32,6 +32,10 @@ IOTBT_POS_BRIGHTNESS = 13
 IOTBT_POS_WHITE_BRIGHTNESS = 15
 IOTBT_COLOR_MODE = 0x24
 IOTBT_WHITE_MODE = 0x25
+# Byte 7 is 0x25 for both white and animations. Byte 8 then holds the
+# sub-mode: 0x6F for white, or the running E1 01 animation model.
+IOTBT_POS_SUB_MODE = 8
+IOTBT_ANIMATION_MODELS = range(1, 103)
 
 # IOTBT command prefixes (v2/v3 unified format).
 IOTBT_CMD_PREFIX = 0x3B
@@ -252,7 +256,13 @@ def parse_state(packet: bytes) -> LightState | None:
             saturation = clamp(packed_hs & 0x7F, 0, 100) / 100
             value = clamp(state[IOTBT_POS_BRIGHTNESS], 0, 100) / 100
             red_f, green_f, blue_f = colorsys.hsv_to_rgb(hue, saturation, value)
-            is_white_mode = state[IOTBT_POS_COLOR_WHITE_MODE] == IOTBT_WHITE_MODE
+            animating = (
+                state[IOTBT_POS_COLOR_WHITE_MODE] == IOTBT_WHITE_MODE
+                and state[IOTBT_POS_SUB_MODE] in IOTBT_ANIMATION_MODELS
+            )
+            is_white_mode = (
+                state[IOTBT_POS_COLOR_WHITE_MODE] == IOTBT_WHITE_MODE and not animating
+            )
             white_percent = (
                 clamp(state[IOTBT_POS_WHITE_BRIGHTNESS], 0, 100) if is_white_mode else 0
             )
@@ -267,6 +277,7 @@ def parse_state(packet: bytes) -> LightState | None:
                 led_count=state[18] if len(state) > 18 else None,
                 raw_hex=state.hex(),
                 product_id=state[4],
+                animation_model=state[IOTBT_POS_SUB_MODE] if animating else None,
             )
         hue = clamp(state[11], 0, 180) * 2 / 360
         saturation = clamp(state[12], 0, 100) / 100

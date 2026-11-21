@@ -24,6 +24,7 @@ from .core.animations import (
     DEFAULT_SPEED,
     DIRECTIONS,
     AnimationCommand,
+    animation_for_model,
     animation_named,
 )
 from .core.client import LightClient
@@ -416,7 +417,7 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
         state = self.data
         if state is None or not state.power or (state.white and state.white > 0):
             return None
-        if self.client is not None and self.client.animation is not None:
+        if self.animation is not None or state.animation_model is not None:
             return None
         segments = self.client.segments if self.client is not None else None
         if segments is not None:
@@ -434,8 +435,18 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
 
     @property
     def animation(self) -> AnimationCommand | None:
-        """The animation the lamp is running, if one was started."""
+        """The animation this integration started, while the lamp still runs it."""
         return self.client.animation if self.client is not None else None
+
+    def animation_name(self) -> str | None:
+        """Name of the animation the lamp is running, including ones started elsewhere."""
+        if self.animation is not None:
+            return self.animation.name
+        state = self.data
+        if state is None or state.animation_model is None:
+            return None
+        animation = animation_for_model(state.animation_model)
+        return animation.name if animation is not None else None
 
     async def async_set_animation(
         self,

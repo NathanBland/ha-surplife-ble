@@ -139,11 +139,11 @@ class SurplifeLight(CoordinatorEntity[SurplifeCoordinator], LightEntity):
         if _supports_segments(self.coordinator):
             self._attr_supported_features = LightEntityFeature.EFFECT
             self._attr_effect_list = [EFFECT_OFF, *PRESET_NAMES, *ANIMATION_NAMES]
-            animation = self.coordinator.animation
+            animation_name = self.coordinator.animation_name()
             if is_white:
                 effect = None
-            elif animation is not None:
-                effect = animation.name
+            elif animation_name is not None:
+                effect = animation_name
             else:
                 effect = matching_preset(client.segments if client else None)
             self._attr_effect = effect or EFFECT_OFF

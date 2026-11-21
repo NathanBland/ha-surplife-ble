@@ -10,11 +10,12 @@ from custom_components.surplife_ble.core.animations import (
     ANIMATION_NAMES,
     DEFAULT_COLORS,
     AnimationCommand,
+    animation_for_model,
     animation_named,
 )
 from custom_components.surplife_ble.core.models import LightState
 from custom_components.surplife_ble.core.presets import PRESET_NAMES
-from custom_components.surplife_ble.core.protocol import iotbt_e1_animation
+from custom_components.surplife_ble.core.protocol import iotbt_e1_animation, parse_state
 from tests.test_coordinator import FakeEntry, FakeHass, _load_coordinator
 from tests.test_segments import FakeLamp, _client
 
@@ -186,3 +187,74 @@ def test_service_effect_options_match_animation_table() -> None:
         if line.strip().startswith("- ")
     ]
     assert options == ANIMATION_NAMES
+
+
+
+WHITE_STATE = "ea810100aa0923256f32f0006464006405001dffffffff01000000"
+ANIMATING_STATE = "ea810100aa0923250914f0aae464006405001dffffffff01000000"
+COLOUR_STATE = "ea810100aa0923240150f0786464006405001dffffffff01000000"
+
+
+def test_state_reports_running_animation_not_white() -> None:
+    animating = parse_state(bytes.fromhex(ANIMATING_STATE))
+    assert animating is not None
+    assert animating.animation_model == 9
+    assert animating.white == 0
+    assert animating.rgb == (255, 0, 81)
+    white = parse_state(bytes.fromhex(WHITE_STATE))
+    assert white is not None and white.animation_model is None and white.white == 255
+    colour = parse_state(bytes.fromhex(COLOUR_STATE))
+    assert colour is not None and colour.animation_model is None and colour.white == 0
+    assert animation_for_model(9) is not None and animation_for_model(111) is None
+
+
+class AnimatingLamp(FakeLamp):
+    """Lamp that reports E1 01 animations in its state like the real one."""
+
+    async def write_gatt_char(self, uuid: str, data: bytes, response: bool | None = None) -> None:
+        body = bytes(data)[8:]
+        if body[:2] == b"\xe1\x01":
+            state = bytearray(self.state)
+            state[7], state[8], state[9] = 0x25, body[4], body[8]
+            self.state = bytes(state)
+        await super().write_gatt_char(uuid, data, response)
+
+
+@pytest.mark.asyncio
+async def test_poll_keeps_animation_and_its_brightness() -> None:
+    fake = AnimatingLamp()
+    client = _client(fake)
+    async with client:
+        await client.probe(allow_writes=True, response_timeout=0.5)
+        await client.set_animation(AnimationCommand(model=9, colors=((255, 0, 0),), brightness=50))
+        polled = await client.query_state(response_timeout=0.5)
+        assert polled is not None
+        assert polled.animation_model == 9
+        assert polled.white == 0
+        assert polled.brightness == 128
+        assert client.animation is not None and client.animation.model == 9
+
+
+@pytest.mark.asyncio
+async def test_animation_is_forgotten_when_lamp_leaves_it() -> None:
+    fake = AnimatingLamp()
+    client = _client(fake)
+    async with client:
+        await client.probe(allow_writes=True, response_timeout=0.5)
+        await client.set_animation(AnimationCommand(model=9, colors=((255, 0, 0),)))
+        fake.state = bytes.fromhex(COLOUR_STATE)
+        await client.query_state(response_timeout=0.5)
+        assert client.animation is None
+
+
+@pytest.mark.asyncio
+async def test_effect_name_comes_from_lamp_state_after_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, _calls = _animation_coordinator(
+        monkeypatch, LightState(power=True, rgb=(255, 0, 0), brightness=255, white=0)
+    )
+    assert coordinator.animation_name() is None
+    coordinator.data = LightState(power=True, rgb=(255, 0, 0), white=0, animation_model=77)
+    assert coordinator.animation_name() == "Sync gradient"
+    assert coordinator.segment_colors() is None

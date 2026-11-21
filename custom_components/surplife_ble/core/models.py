@@ -132,6 +132,8 @@ class LightState:
     # Per-segment colours last sent by this integration. The lamp reports only
     # one colour, so these are remembered rather than read back.
     segments: tuple[tuple[int, int, int], ...] | None = None
+    # Built-in animation model the lamp reports running (E1 01), if any.
+    animation_model: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

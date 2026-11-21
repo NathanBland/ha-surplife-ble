@@ -96,3 +96,8 @@ def animation_named(name: str) -> Animation:
         return ANIMATIONS_BY_NAME[name]
     except KeyError:
         raise ValueError(f"unknown animation {name!r}") from None
+
+
+def animation_for_model(model: int | None) -> Animation | None:
+    """The built-in animation with this model number, if it is one we list."""
+    return next((animation for animation in ANIMATIONS if animation.model == model), None)

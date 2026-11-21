@@ -554,8 +554,21 @@ class LightClient:
         resolution.repeatable = bool(self.resolution and self.resolution.repeatable)
         resolution.transport = self.resolution.transport if self.resolution else None
         self.resolution = resolution
+        self._reconcile_animation(state)
         self.state = state
         return state
+
+    def _reconcile_animation(self, state: LightState) -> None:
+        """Keep the remembered animation in step with what the lamp reports."""
+        if self._animation is None or state.raw_hex == "":
+            return
+        if state.animation_model != self._animation.model:
+            # The lamp left the animation (another app, a remote, a power cycle).
+            self._animation = None
+            return
+        # The lamp reports the first colour's value, not the animation
+        # brightness, so keep the commanded brightness.
+        state.brightness = round(self._animation.brightness * 255 / 100)
 
     async def query_raw_state(self) -> bytes | None:
         """Query and return the raw state packet bytes, or None if no response."""
@@ -774,9 +787,10 @@ class LightClient:
             command_family=IOTBT_COMMAND_FAMILY,
         )
         self._segments = None
-        self._animation = command
+        self._animation = None
         commanded = LightState(
             power=True,
+            animation_model=command.model,
             rgb=command.colors[0],
             brightness=round(brightness * 255 / 100),
             white=0,
@@ -793,6 +807,11 @@ class LightClient:
             _LOGGER.debug("State while animating model %s: %s", command.model, reply.raw_hex)
             if reply.power is not None:
                 commanded.power = reply.power
+            if reply.animation_model is not None and reply.animation_model != command.model:
+                _LOGGER.debug(
+                    "Lamp reports model %s after sending %s", reply.animation_model, command.model
+                )
+        self._animation = command
         self.state = commanded
 
     async def set_rgb(
