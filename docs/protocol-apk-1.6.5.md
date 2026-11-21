@@ -321,3 +321,13 @@ halving as Likely; it gives wave = 1, speed 50 and brightness 80, which all look
 \* The function builds separate lists per product family, so values 48/49 mean different
 things in different lists. Which list product 170 gets is not confirmed yet. Models 1–22
 and 101/102 appear in every list.
+
+### 10.4 Hardware results (product 170, 2026-11-20)
+
+- The lamp accepted all 26 animations sent on family 0x0B (models 1–22, 69, 75, 76, 77).
+- While animating, the EA 81 state reports byte 7 = `0x25`, byte 8 = model, byte 9 = speed,
+  and bytes 11–13 = the first colour as packed hue/saturation plus value. Example for
+  Breathe at speed 20 with first colour (255, 0, 80): `ea810100aa0923250914f0aae464...`.
+- White mode also uses byte 7 = `0x25`, but with byte 8 = `0x6f`.
+- The state does not report the animation's brightness.
+- The lamp resumes the animation after power off/on.
