@@ -24,6 +24,8 @@ async def async_get_config_entry_diagnostics(
             "address": coordinator.address,
             "version": entry.version,
         },
+        "connection_mode": "persistent" if coordinator.keep_connected else "on_demand",
+        "disconnect_delay": coordinator.disconnect_delay,
         "connected": coordinator.client is not None and coordinator.client.connected,
         "state": {
             "power": state.power if state else None,

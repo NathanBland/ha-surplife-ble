@@ -15,6 +15,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     from homeassistant.const import CONF_ADDRESS, Platform
     from homeassistant.core import callback
 
+    from .const import CONF_DISCONNECT_DELAY, DEFAULT_DISCONNECT_DELAY
     from .coordinator import SurplifeCoordinator, SurplifeRuntimeData
 
     address = entry.data[CONF_ADDRESS]
@@ -36,6 +37,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             bluetooth.BluetoothScanningMode.PASSIVE,
         )
     )
+
+    async def _async_update_options(
+        _hass: HomeAssistant, updated_entry: ConfigEntry
+    ) -> None:
+        delay = updated_entry.options.get(
+            CONF_DISCONNECT_DELAY, DEFAULT_DISCONNECT_DELAY
+        )
+        await updated_entry.runtime_data.coordinator.async_set_disconnect_delay(delay)
+
+    entry.async_on_unload(entry.add_update_listener(_async_update_options))
 
     await hass.config_entries.async_forward_entry_setups(entry, [Platform.LIGHT])
     entry.async_create_background_task(

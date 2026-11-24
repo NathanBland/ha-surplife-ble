@@ -8,11 +8,22 @@ import voluptuous as vol
 from bleak import BleakError
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import BluetoothServiceInfo, BluetoothServiceInfoBleak
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
 from homeassistant.const import CONF_ADDRESS, CONF_NAME
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 
-from .const import DOMAIN
+from .const import (
+    CONF_DISCONNECT_DELAY,
+    DEFAULT_DISCONNECT_DELAY,
+    DOMAIN,
+    MAX_DISCONNECT_DELAY,
+    MIN_DISCONNECT_DELAY,
+)
 
 # Service data UUID prefix advertised by IOTBT/Surplife BLE lights.
 # Devices may use 00005a00, 00005a02, etc. — match by prefix.
@@ -70,6 +81,12 @@ class SurplifeBleConfigFlow(ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
+        """Return the options flow for Surplife BLE."""
+        return SurplifeBleOptionsFlow()
+
     def __init__(self) -> None:
         """Initialize the config flow."""
         self._discovery_info: BluetoothServiceInfoBleak | None = None
@@ -105,15 +122,24 @@ class SurplifeBleConfigFlow(ConfigFlow, domain=DOMAIN):
             await self.async_set_unique_id(address.upper())
             self._abort_if_unique_id_configured()
 
-            # Validate connection before creating entry
-            error = await _validate_device(self.hass, address)
-            if error:
-                errors[CONF_ADDRESS] = error
+            if address in self._discovered_devices:
+                if bluetooth.async_ble_device_from_address(self.hass, address, True) is None:
+                    errors[CONF_ADDRESS] = "device_not_found"
+                else:
+                    return self.async_create_entry(
+                        title=name,
+                        data={CONF_ADDRESS: address},
+                    )
             else:
-                return self.async_create_entry(
-                    title=name,
-                    data={CONF_ADDRESS: address},
-                )
+                # Validate connection before creating entry for manual entry
+                error = await _validate_device(self.hass, address)
+                if error:
+                    errors[CONF_ADDRESS] = error
+                else:
+                    return self.async_create_entry(
+                        title=name,
+                        data={CONF_ADDRESS: address},
+                    )
 
         # Gather discovered devices that match our criteria
         if self._discovery_info is not None:
@@ -188,4 +214,33 @@ class SurplifeBleConfigFlow(ConfigFlow, domain=DOMAIN):
             ),
             errors=errors,
             description_placeholders={},
+        )
+
+
+class SurplifeBleOptionsFlow(OptionsFlow):
+    """Handle options for Surplife BLE."""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage Surplife BLE options."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        current_delay = self.config_entry.options.get(
+            CONF_DISCONNECT_DELAY, DEFAULT_DISCONNECT_DELAY
+        )
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_DISCONNECT_DELAY,
+                        default=current_delay,
+                    ): vol.All(
+                        vol.Coerce(int),
+                        vol.Range(min=MIN_DISCONNECT_DELAY, max=MAX_DISCONNECT_DELAY),
+                    ),
+                }
+            ),
         )

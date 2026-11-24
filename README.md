@@ -60,6 +60,14 @@ Configure the integration through the UI:
 > **Tip:** If discovery does not find your device, use a BLE scanner app to find its address.
 > The device advertises as `IOTBT` followed by a short string. For example, `IOTBT144`.
 
+### Connection mode (`disconnect_delay`)
+
+By default, Surplife BLE connects on demand when you send a command and disconnects after **30 seconds** of inactivity (`disconnect_delay = 30`). This frees Bluetooth adapter and ESPHome proxy connection slots and allows the vendor app to reconnect when idle.
+
+To change this per device, go to **Settings → Devices & Services → Surplife BLE → Configure**:
+- **`1`–`3600` seconds:** On-demand connection with idle disconnect after the configured delay; availability is tracked from BLE advertisements.
+- **`0` seconds:** Keep a persistent BLE connection open and poll every 15 seconds.
+
 ### Per-segment color
 
 Lamps that support segments get two extra controls:
@@ -133,15 +141,14 @@ A matching poll confirms the state. The assumed state expires after five seconds
 **Use one controller at a time.**
 
 The lamp accepts one active BLE controller at a time.
-The integration keeps its connection open for faster commands.
-Each connected lamp uses one Bluetooth adapter or proxy connection slot.
+With the default 30-second idle disconnect delay, Home Assistant frees its connection slot (and lets the vendor app connect) after 30 seconds of inactivity. If you set `disconnect_delay` to `0` for faster repeated commands, the integration keeps its connection open continuously and holds one Bluetooth adapter or proxy slot.
 Close the vendor app before you control the lamp from Home Assistant.
-External changes appear after the assumed state expires and a poll succeeds.
+External changes appear on the next command or when polling is enabled (`disconnect_delay = 0`).
 
 **The first connection can take several seconds.**
 
-The integration keeps a successful connection open.
-Tests measured later color and brightness commands at approximately 0.2 to 0.8 seconds.
+While the connection remains open (within `disconnect_delay`, or always when `disconnect_delay = 0`),
+tests measured later color and brightness commands at approximately 0.2 to 0.8 seconds.
 
 **Brightness in color mode sends the full color command again.**
 

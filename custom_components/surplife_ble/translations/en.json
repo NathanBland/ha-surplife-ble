@@ -27,6 +27,20 @@
       }
     }
   },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Surplife BLE options",
+        "description": "Configure how Home Assistant manages the Bluetooth connection to this light.",
+        "data": {
+          "disconnect_delay": "Idle disconnect delay (seconds)"
+        },
+        "data_description": {
+          "disconnect_delay": "Seconds to wait after a command before disconnecting to free Bluetooth proxy slots. Set to 0 to keep a persistent connection and poll every 15 seconds."
+        }
+      }
+    }
+  },
   "services": {
     "set_segments": {
       "name": "Set segment colors",

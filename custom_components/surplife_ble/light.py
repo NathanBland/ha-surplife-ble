@@ -121,6 +121,13 @@ class SurplifeLight(CoordinatorEntity[SurplifeCoordinator], LightEntity):
         )
         self._async_update_attrs()
 
+    @property
+    def available(self) -> bool:
+        """Stay available in on-demand mode while Home Assistant sees the device."""
+        if self.coordinator.keep_connected:
+            return super().available
+        return super().available or self.coordinator.is_ble_visible()
+
     @callback
     def _async_update_attrs(self) -> None:
         state = self.coordinator.data
@@ -281,6 +288,13 @@ class SurplifeSegmentLight(CoordinatorEntity[SurplifeCoordinator], LightEntity):
         self._attr_translation_placeholders = {"number": str(index + 1)}
         self._attr_device_info = _device_info(coordinator)
         self._async_update_attrs()
+
+    @property
+    def available(self) -> bool:
+        """Stay available in on-demand mode while Home Assistant sees the device."""
+        if self.coordinator.keep_connected:
+            return super().available
+        return super().available or self.coordinator.is_ble_visible()
 
     @callback
     def _async_update_attrs(self) -> None:
