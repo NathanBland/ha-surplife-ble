@@ -18,7 +18,7 @@ from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import UPDATE_INTERVAL
+from .const import CONF_DISCONNECT_DELAY, DEFAULT_DISCONNECT_DELAY, UPDATE_INTERVAL
 from .core.animations import (
     DEFAULT_COLORS,
     DEFAULT_SPEED,
@@ -84,12 +84,16 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
     """Manage the resolved client and expose normalized state."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        options = getattr(entry, "options", None) or {}
+        self._disconnect_delay: int = max(
+            0, int(options.get(CONF_DISCONNECT_DELAY, DEFAULT_DISCONNECT_DELAY))
+        )
         super().__init__(
             hass,
             _LOGGER,
             config_entry=entry,
             name=entry.title,
-            update_interval=UPDATE_INTERVAL,
+            update_interval=UPDATE_INTERVAL if self.keep_connected else None,
             # BLE devices can't handle concurrent commands — serialize per device
             always_update=False,
         )
@@ -98,6 +102,8 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
         self._ble_device: BLEDevice | None = None
         self._advertisement: AdvertisementData | None = None
         self._was_available: bool = False
+        self._ble_visible: bool = False
+        self._last_seen: float | None = None
         self._operation_lock = asyncio.Lock()
         self._assumed_rgb: tuple[int, int, int] | None = None
         self._assumed_rgb_brightness: int | None = None
@@ -108,10 +114,85 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
         self._strip_profile_attempted = False
         self._next_probe_at: float | None = None
         self._connect_failed_at: float | None = None
+        self._disconnect_timer: asyncio.TimerHandle | None = None
+        self._disconnect_task: asyncio.Task[None] | None = None
         self._segment_target: list[tuple[int, int, int]] | None = None
         self._segment_generation = 0
         self._segment_sent_generation = 0
         self._segment_lock = asyncio.Lock()
+
+    @property
+    def disconnect_delay(self) -> int:
+        """Seconds of inactivity before disconnecting (0 keeps a persistent link)."""
+        return self._disconnect_delay
+
+    @property
+    def keep_connected(self) -> bool:
+        """Return True when configured for persistent polling instead of on-demand."""
+        return self._disconnect_delay == 0
+
+    @property
+    def on_demand(self) -> bool:
+        """Return True when idle connections are closed after disconnect_delay."""
+        return self._disconnect_delay > 0
+
+    def is_ble_visible(self) -> bool:
+        """Return True when Home Assistant sees advertisements for this device."""
+        address = self.address.upper()
+        return (
+            bluetooth.async_ble_device_from_address(self.hass, address, True) is not None
+            or bluetooth.async_ble_device_from_address(self.hass, address, False) is not None
+        )
+
+    def _cancel_disconnect_timer(self) -> None:
+        if self._disconnect_timer is not None:
+            self._disconnect_timer.cancel()
+            self._disconnect_timer = None
+
+    def _schedule_disconnect(self) -> None:
+        self._cancel_disconnect_timer()
+        if self.keep_connected:
+            return
+        with suppress(RuntimeError):
+            loop = asyncio.get_running_loop()
+            self._disconnect_timer = loop.call_later(
+                self._disconnect_delay, self._trigger_idle_disconnect
+            )
+
+    def _trigger_idle_disconnect(self) -> None:
+        self._disconnect_timer = None
+        with suppress(RuntimeError):
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(self._async_idle_disconnect())
+            self._disconnect_task = task
+            task.add_done_callback(self._clear_disconnect_task)
+
+    def _clear_disconnect_task(self, task: asyncio.Task[None]) -> None:
+        if self._disconnect_task is task:
+            self._disconnect_task = None
+
+    async def _async_idle_disconnect(self) -> None:
+        async with self._operation_lock:
+            if self.keep_connected or self._disconnect_timer is not None:
+                return
+            if self.client is None or not getattr(self.client, "connected", False):
+                return
+            _LOGGER.debug(
+                "Disconnecting idle Surplife BLE device %s after %ss",
+                self.address,
+                self._disconnect_delay,
+            )
+            await self._async_reset_connection()
+
+    async def async_set_disconnect_delay(self, delay: int) -> None:
+        """Apply an updated idle disconnect delay from entry options."""
+        self._disconnect_delay = max(0, int(delay))
+        self.update_interval = UPDATE_INTERVAL if self.keep_connected else None
+        if self.keep_connected:
+            self._cancel_disconnect_timer()
+            await self.async_request_refresh()
+        elif self.client is not None and getattr(self.client, "connected", False):
+            self._schedule_disconnect()
 
     def async_set_ble_device(
         self, device: BLEDevice, advertisement: AdvertisementData | None
@@ -119,8 +200,15 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
         """Refresh the nearest-adapter BLEDevice from Home Assistant's cache."""
         self._ble_device = device
         self._advertisement = advertisement
+        with suppress(RuntimeError):
+            self._last_seen = asyncio.get_running_loop().time()
         if self.client:
             self.client.set_ble_device(device, advertisement)
+        if self.on_demand and not self._ble_visible:
+            self._ble_visible = True
+            notify = getattr(self, "async_update_listeners", None)
+            if callable(notify):
+                notify()
 
     def _current_ble_device(self, fallback: BLEDevice | None = None) -> BLEDevice | None:
         return (
@@ -226,8 +314,16 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
 
     async def _refresh_after_assumed_deadline(self, deadline: float) -> None:
         await asyncio.sleep(max(0, deadline - asyncio.get_running_loop().time()))
-        if self._assumed_rgb_deadline == deadline:
-            await self.async_request_refresh()
+        if self._assumed_rgb_deadline != deadline:
+            return
+        if self.on_demand and not (
+            self.client is not None and getattr(self.client, "connected", False)
+        ):
+            self._clear_assumed_rgb()
+            if self.data is not None:
+                self.async_set_updated_data(replace(self.data, assumed=False))
+            return
+        await self.async_request_refresh()
 
     async def _refresh_after_command(self, generation: int) -> None:
         await asyncio.sleep(_CONFIRMATION_DELAY_SECONDS)
@@ -314,6 +410,7 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
 
     async def _async_update_data(self) -> LightState:
         async with self._operation_lock:
+            self._cancel_disconnect_timer()
             client = self.client
             if client is not None and not client.resolved and self._probe_backoff_active():
                 # Probing writes a burst of guessed frames. Repeating it on every
@@ -324,6 +421,7 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
             except Exception as err:
                 return await self._async_handle_poll_failure(err)
             self._record_success()
+            self._schedule_disconnect()
             return self._reconcile_assumed_rgb(state)
 
     async def _async_handle_poll_failure(self, err: Exception) -> LightState:
@@ -374,6 +472,7 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
 
     async def _async_command(self, method: str, *args: Any, **kwargs: Any) -> LightState:
         async with self._operation_lock:
+            self._cancel_disconnect_timer()
             if self._connect_cooldown_active():
                 # Commands queued behind a failed connection would each make
                 # their own attempt. Fail them now; the next poll reconnects.
@@ -389,10 +488,18 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
             except (BleakError, TimeoutError, OSError) as err:
                 _LOGGER.debug("Command %s failed, reconnecting and retrying: %s", method, err)
                 await self._async_reset_connection(clear_cache=isinstance(err, BleakError))
-                await self._async_run_command(method, *args, **kwargs)
+                try:
+                    await self._async_run_command(method, *args, **kwargs)
+                except Exception:
+                    self._schedule_disconnect()
+                    raise
+            except Exception:
+                self._schedule_disconnect()
+                raise
             assert self.client is not None and self.client.state is not None
             self._record_success()
             self.async_set_updated_data(self.client.state)
+            self._schedule_disconnect()
             return self.client.state
 
     async def async_set_segments(
@@ -560,4 +667,10 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
             self._clear_assumed_rgb()
 
     async def async_disconnect(self) -> None:
+        self._cancel_disconnect_timer()
+        if self._disconnect_task is not None and not self._disconnect_task.done():
+            self._disconnect_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._disconnect_task
+        self._disconnect_task = None
         await self._async_reset_connection()

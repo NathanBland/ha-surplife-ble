@@ -39,16 +39,21 @@ def _load_coordinator(monkeypatch: pytest.MonkeyPatch) -> Any:
             _logger: logging.Logger,
             *,
             config_entry: object,
-            **_kwargs: object,
+            **kwargs: object,
         ) -> None:
             self.hass = hass
             self.config_entry = config_entry
+            self.update_interval = kwargs.get("update_interval")
+            self.listener_updates = 0
 
         async def async_request_refresh(self) -> None:
             return None
 
         def async_set_updated_data(self, data: LightState) -> None:
             self.data = data
+
+        def async_update_listeners(self) -> None:
+            self.listener_updates += 1
 
     class UpdateFailed(Exception):
         pass
@@ -534,3 +539,190 @@ async def test_set_segments_powers_on_an_off_lamp_first(
     coordinator._async_command = command
     await coordinator.async_set_preset("Rainbow")
     assert order == ["power", "set_segments"]
+
+
+class OnDemandEntry:
+    title = "Test light"
+    data = {"address": "DEVICE"}
+
+    def __init__(self, options: dict[str, Any] | None = None) -> None:
+        self.options = options or {}
+
+
+@pytest.mark.asyncio
+async def test_on_demand_defaults_and_idle_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_coordinator(monkeypatch)
+    coordinator = module.SurplifeCoordinator(FakeHass(), OnDemandEntry())
+    assert coordinator.on_demand is True
+    assert coordinator.keep_connected is False
+    assert coordinator.disconnect_delay == 30
+    assert coordinator.update_interval is None
+
+    coordinator._ble_device = object()
+    client = UnreachableFakeClient()
+    client.hang_attempts = 0
+    coordinator.client = client
+    coordinator._disconnect_delay = 0.05  # type: ignore[assignment]
+
+    await coordinator._async_command("set_power", True)
+    assert client.connected is True
+    assert coordinator._disconnect_timer is not None
+
+    await asyncio.sleep(0.1)
+    assert client.connected is False
+    assert coordinator._disconnect_timer is None
+
+
+@pytest.mark.asyncio
+async def test_second_command_resets_idle_timer_and_reuses_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_coordinator(monkeypatch)
+    coordinator = module.SurplifeCoordinator(FakeHass(), OnDemandEntry())
+    coordinator._ble_device = object()
+    client = UnreachableFakeClient()
+    client.hang_attempts = 0
+    coordinator.client = client
+    coordinator._disconnect_delay = 0.08  # type: ignore[assignment]
+
+    await coordinator._async_command("set_power", True)
+    first_timer = coordinator._disconnect_timer
+    assert client.connects == 1
+
+    await asyncio.sleep(0.04)
+    assert client.connected is True
+    await coordinator._async_command("set_power", False)
+    assert client.connects == 1
+    assert coordinator._disconnect_timer is not first_timer
+    assert first_timer is not None and first_timer.cancelled()
+
+    await asyncio.sleep(0.05)
+    assert client.connected is True
+
+    await asyncio.sleep(0.06)
+    assert client.connected is False
+
+
+@pytest.mark.asyncio
+async def test_zero_disconnect_delay_uses_persistent_polling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_coordinator(monkeypatch)
+    coordinator = module.SurplifeCoordinator(
+        FakeHass(), OnDemandEntry({"disconnect_delay": 0})
+    )
+    assert coordinator.keep_connected is True
+    assert coordinator.on_demand is False
+    assert coordinator.update_interval == module.UPDATE_INTERVAL
+
+    coordinator._ble_device = object()
+    client = UnreachableFakeClient()
+    client.hang_attempts = 0
+    coordinator.client = client
+
+    await coordinator._async_command("set_power", True)
+    assert client.connected is True
+    assert coordinator._disconnect_timer is None
+
+
+@pytest.mark.asyncio
+async def test_dynamic_disconnect_delay_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_coordinator(monkeypatch)
+    coordinator = module.SurplifeCoordinator(FakeHass(), OnDemandEntry())
+    client = UnreachableFakeClient()
+    client.connected = True
+    coordinator.client = client
+
+    refreshes = 0
+
+    async def refresh() -> None:
+        nonlocal refreshes
+        refreshes += 1
+
+    coordinator.async_request_refresh = refresh
+    coordinator._schedule_disconnect()
+    assert coordinator._disconnect_timer is not None
+
+    await coordinator.async_set_disconnect_delay(0)
+    assert coordinator.keep_connected is True
+    assert coordinator.update_interval == module.UPDATE_INTERVAL
+    assert coordinator._disconnect_timer is None
+    assert refreshes == 1
+
+    await coordinator.async_set_disconnect_delay(15)
+    assert coordinator.on_demand is True
+    assert coordinator.update_interval is None
+    assert coordinator._disconnect_timer is not None
+    await coordinator.async_disconnect()
+
+
+def test_ble_visibility_and_advertisement_wakeup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_coordinator(monkeypatch)
+    coordinator = module.SurplifeCoordinator(FakeHass(), OnDemandEntry())
+    assert coordinator.is_ble_visible() is False
+
+    seen: dict[bool, object | None] = {True: None, False: object()}
+    monkeypatch.setattr(
+        module.bluetooth,
+        "async_ble_device_from_address",
+        lambda _hass, _addr, connectable: seen[connectable],
+    )
+    assert coordinator.is_ble_visible() is True
+
+    coordinator.async_set_ble_device(object(), None)
+    assert coordinator.listener_updates == 1
+    coordinator.async_set_ble_device(object(), None)
+    assert coordinator.listener_updates == 1
+
+
+@pytest.mark.asyncio
+async def test_assumed_deadline_does_not_reconnect_when_idle_disconnected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_coordinator(monkeypatch)
+    coordinator = module.SurplifeCoordinator(FakeHass(), OnDemandEntry())
+    coordinator.data = LightState(
+        power=True, rgb=(255, 0, 0), brightness=255, white=0, assumed=True
+    )
+    coordinator._assumed_rgb = (255, 0, 0)
+    coordinator._assumed_rgb_brightness = 255
+    deadline = asyncio.get_running_loop().time()
+    coordinator._assumed_rgb_deadline = deadline
+
+    refreshes = 0
+
+    async def refresh() -> None:
+        nonlocal refreshes
+        refreshes += 1
+
+    coordinator.async_request_refresh = refresh
+    await coordinator._refresh_after_assumed_deadline(deadline)
+    assert refreshes == 0
+    assert coordinator._assumed_rgb is None
+    assert coordinator.data.assumed is False
+
+
+@pytest.mark.asyncio
+async def test_async_disconnect_cancels_pending_timer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_coordinator(monkeypatch)
+    coordinator = module.SurplifeCoordinator(FakeHass(), OnDemandEntry())
+    client = UnreachableFakeClient()
+    client.connected = True
+    coordinator.client = client
+
+    coordinator._schedule_disconnect()
+    timer = coordinator._disconnect_timer
+    assert timer is not None
+
+    await coordinator.async_disconnect()
+    assert timer.cancelled()
+    assert coordinator._disconnect_timer is None
+    assert client.connected is False
